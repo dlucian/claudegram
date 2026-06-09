@@ -1,0 +1,7 @@
+{
+  "name": "claudegram",
+  "owner": { "name": "Lucian / Ezri" },
+  "plugins": [
+    { "name": "telegram", "source": "." }
+  ]
+}
