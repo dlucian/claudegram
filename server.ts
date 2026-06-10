@@ -171,6 +171,20 @@ try {
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN
 const STATIC = process.env.TELEGRAM_ACCESS_MODE === 'static'
 
+// ezri#56: Groq STT key for voice transcription.
+// Try process.env first (populated by ENV_FILE loading above), then
+// fall back to ~/.config/ezri/keys.sh. Absent → STT skipped; inbound path unaffected.
+const EZRI_KEYS_SH = join(homedir(), '.config', 'ezri', 'keys.sh')
+let GROQ_API_KEY: string | undefined = process.env.GROQ_API_KEY
+if (!GROQ_API_KEY) {
+  try {
+    for (const line of readFileSync(EZRI_KEYS_SH, 'utf8').split('\n')) {
+      const m = line.match(/^export\s+GROQ_API_KEY=["']?([^"'\s#]+)/)
+      if (m) { GROQ_API_KEY = m[1]; break }
+    }
+  } catch {}
+}
+
 if (!TOKEN) {
   process.stderr.write(
     `telegram channel: TELEGRAM_BOT_TOKEN required\n` +
@@ -1203,7 +1217,69 @@ bot.on('message:document', async ctx => {
 
 bot.on('message:voice', async ctx => {
   const voice = ctx.message.voice
-  const text = ctx.message.caption ?? '(voice message)'
+  const caption = ctx.message.caption
+  let text = caption ?? '(voice message)'
+  // ezri#56: inline Groq Whisper STT for allowlisted senders.
+  // assertAllowedChat() is the no-side-effect allowlist check — throws for
+  // non-allowlisted chats; skip STT and let handleInbound handle the gate.
+  if (GROQ_API_KEY) {
+    let allowlisted = false
+    // group chats are excluded from STT (sender/mention gating lives in gate(); STT only trusts the simple private-DM allowlist)
+    try { if (ctx.chat?.type === 'private') { assertAllowedChat(String(ctx.chat!.id)); allowlisted = true } } catch {}
+    if (allowlisted) {
+      const dlAbort = new AbortController()
+      const dlTimer = setTimeout(() => dlAbort.abort(), 30_000)
+      let audioBytes: ArrayBuffer | undefined
+      try {
+        const fileInfo = await bot.api.getFile(voice.file_id, dlAbort.signal)
+        if (fileInfo.file_path) {
+          // Bot API requires token in URL — don't log this value.
+          const dlResp = await fetch(
+            `https://api.telegram.org/file/bot${TOKEN}/${fileInfo.file_path}`,
+            { signal: dlAbort.signal },
+          )
+          audioBytes = await dlResp.arrayBuffer()
+          if (!dlResp.ok) audioBytes = undefined
+        }
+      } catch (dlErr) {
+        const short = (dlErr instanceof Error ? dlErr.message : String(dlErr)).slice(0, 80)
+        console.error('[voice-stt] file download failed:', short)
+        text = `${text}\ntranscription_error=${short}`
+      } finally {
+        clearTimeout(dlTimer)
+      }
+      if (audioBytes) {
+        // Groq rejects .oga extension — use .ogg in the FormData upload.
+        const form = new FormData()
+        form.append('file', new Blob([audioBytes], { type: 'audio/ogg' }), 'voice.ogg')
+        form.append('model', 'whisper-large-v3-turbo')
+        const sttAbort = new AbortController()
+        const sttTimer = setTimeout(() => sttAbort.abort(), 30_000)
+        try {
+          const sttResp = await fetch(
+            'https://api.groq.com/openai/v1/audio/transcriptions',
+            { method: 'POST', headers: { Authorization: `Bearer ${GROQ_API_KEY}` }, body: form, signal: sttAbort.signal },
+          )
+          const sttJson = await sttResp.json() as { text?: string; error?: { message?: string } }
+          if (sttResp.ok && sttJson.text?.trim()) {
+            const t = sttJson.text.trim()
+            text = caption
+              ? `${caption}\n(voice transcript): "${t}"`
+              : `(voice message): "${t}"`
+          } else if (!sttResp.ok) {
+            const errMsg = (sttJson.error?.message ?? String(sttResp.status)).slice(0, 80)
+            text = `${text}\ntranscription_error=groq_http_${sttResp.status} ${errMsg}`
+          }
+        } catch (sttErr) {
+          const short = (sttErr instanceof Error ? sttErr.message : String(sttErr)).slice(0, 80)
+          console.error('[voice-stt] Groq request failed:', short)
+          text = `${text}\ntranscription_error=${short}`
+        } finally {
+          clearTimeout(sttTimer)
+        }
+      }
+    }
+  }
   await handleInbound(ctx, text, undefined, {
     kind: 'voice',
     file_id: voice.file_id,
