@@ -1215,6 +1215,31 @@ bot.on('message:document', async ctx => {
   })
 })
 
+// claudegram#2 / ezri#56: getFile + the file download can fail on a single
+// transient network blip ("Network request for 'getFile' failed!" was observed
+// twice in 20 min, both recoverable seconds later) — one failure used to drop
+// the whole transcription to the bare "(voice message)" placeholder. Retry
+// network/abort errors with backoff; never retry a deterministic GrammyError
+// 4xx (bad/oversized file_id), which is a real, non-transient rejection.
+async function withNetRetry<T>(label: string, fn: () => Promise<T>, attempts = 3): Promise<T> {
+  let lastErr: unknown
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      return await fn()
+    } catch (err) {
+      if (err instanceof GrammyError) throw err // deterministic API rejection — don't retry
+      lastErr = err
+      if (i < attempts) {
+        const delay = 500 * 2 ** (i - 1) // 0.5s, 1s
+        const short = (err instanceof Error ? err.message : String(err)).slice(0, 80)
+        console.error(`[voice-stt] ${label} failed (attempt ${i}/${attempts}), retrying in ${delay}ms: ${short}`)
+        await new Promise(r => setTimeout(r, delay))
+      }
+    }
+  }
+  throw lastErr
+}
+
 bot.on('message:voice', async ctx => {
   const voice = ctx.message.voice
   const caption = ctx.message.caption
@@ -1227,55 +1252,68 @@ bot.on('message:voice', async ctx => {
     // group chats are excluded from STT (sender/mention gating lives in gate(); STT only trusts the simple private-DM allowlist)
     try { if (ctx.chat?.type === 'private') { assertAllowedChat(String(ctx.chat!.id)); allowlisted = true } } catch {}
     if (allowlisted) {
-      const dlAbort = new AbortController()
-      const dlTimer = setTimeout(() => dlAbort.abort(), 30_000)
       let audioBytes: ArrayBuffer | undefined
       try {
-        const fileInfo = await bot.api.getFile(voice.file_id, dlAbort.signal)
-        if (fileInfo.file_path) {
-          // Bot API requires token in URL — don't log this value.
-          const dlResp = await fetch(
-            `https://api.telegram.org/file/bot${TOKEN}/${fileInfo.file_path}`,
-            { signal: dlAbort.signal },
-          )
-          audioBytes = await dlResp.arrayBuffer()
-          if (!dlResp.ok) audioBytes = undefined
-        }
+        audioBytes = await withNetRetry('file download', async () => {
+          // Fresh abort controller per attempt — a reused, already-aborted
+          // signal would poison every retry. 30s guards a hang, not a blip.
+          const dlAbort = new AbortController()
+          const dlTimer = setTimeout(() => dlAbort.abort(), 30_000)
+          try {
+            const fileInfo = await bot.api.getFile(voice.file_id, dlAbort.signal)
+            if (!fileInfo.file_path) return undefined // nothing to fetch — not an error
+            // Bot API requires token in URL — don't log this value.
+            const dlResp = await fetch(
+              `https://api.telegram.org/file/bot${TOKEN}/${fileInfo.file_path}`,
+              { signal: dlAbort.signal },
+            )
+            if (!dlResp.ok) throw new Error(`file fetch http_${dlResp.status}`)
+            return await dlResp.arrayBuffer()
+          } finally {
+            clearTimeout(dlTimer)
+          }
+        })
       } catch (dlErr) {
         const short = (dlErr instanceof Error ? dlErr.message : String(dlErr)).slice(0, 80)
-        console.error('[voice-stt] file download failed:', short)
+        console.error('[voice-stt] file download failed after retries:', short)
         text = `${text}\ntranscription_error=${short}`
-      } finally {
-        clearTimeout(dlTimer)
       }
       if (audioBytes) {
-        // Groq rejects .oga extension — use .ogg in the FormData upload.
-        const form = new FormData()
-        form.append('file', new Blob([audioBytes], { type: 'audio/ogg' }), 'voice.ogg')
-        form.append('model', 'whisper-large-v3-turbo')
-        const sttAbort = new AbortController()
-        const sttTimer = setTimeout(() => sttAbort.abort(), 30_000)
         try {
-          const sttResp = await fetch(
-            'https://api.groq.com/openai/v1/audio/transcriptions',
-            { method: 'POST', headers: { Authorization: `Bearer ${GROQ_API_KEY}` }, body: form, signal: sttAbort.signal },
-          )
-          const sttJson = await sttResp.json() as { text?: string; error?: { message?: string } }
-          if (sttResp.ok && sttJson.text?.trim()) {
-            const t = sttJson.text.trim()
+          const stt = await withNetRetry('Groq STT', async () => {
+            // Rebuild the form per attempt (a consumed body can't be re-sent).
+            // Groq rejects .oga extension — use .ogg in the FormData upload.
+            const form = new FormData()
+            form.append('file', new Blob([audioBytes!], { type: 'audio/ogg' }), 'voice.ogg')
+            form.append('model', 'whisper-large-v3-turbo')
+            const sttAbort = new AbortController()
+            const sttTimer = setTimeout(() => sttAbort.abort(), 30_000)
+            try {
+              const sttResp = await fetch(
+                'https://api.groq.com/openai/v1/audio/transcriptions',
+                { method: 'POST', headers: { Authorization: `Bearer ${GROQ_API_KEY}` }, body: form, signal: sttAbort.signal },
+              )
+              // A parsed HTTP response (even 4xx) is a real answer, not a network
+              // failure — return it so withNetRetry does NOT retry a 4xx.
+              const json = await sttResp.json() as { text?: string; error?: { message?: string } }
+              return { ok: sttResp.ok, status: sttResp.status, json }
+            } finally {
+              clearTimeout(sttTimer)
+            }
+          })
+          if (stt.ok && stt.json.text?.trim()) {
+            const t = stt.json.text.trim()
             text = caption
               ? `${caption}\n(voice transcript): "${t}"`
               : `(voice message): "${t}"`
-          } else if (!sttResp.ok) {
-            const errMsg = (sttJson.error?.message ?? String(sttResp.status)).slice(0, 80)
-            text = `${text}\ntranscription_error=groq_http_${sttResp.status} ${errMsg}`
+          } else if (!stt.ok) {
+            const errMsg = (stt.json.error?.message ?? String(stt.status)).slice(0, 80)
+            text = `${text}\ntranscription_error=groq_http_${stt.status} ${errMsg}`
           }
         } catch (sttErr) {
           const short = (sttErr instanceof Error ? sttErr.message : String(sttErr)).slice(0, 80)
-          console.error('[voice-stt] Groq request failed:', short)
+          console.error('[voice-stt] Groq request failed after retries:', short)
           text = `${text}\ntranscription_error=${short}`
-        } finally {
-          clearTimeout(sttTimer)
         }
       }
     }
