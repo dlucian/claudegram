@@ -636,7 +636,17 @@ const pendingPermissions = new Map<string, { tool_name: string; description: str
 // resolved back to its option label and injected as a normal inbound message.
 // The non-blocking answer to AskUserQuestion's terminal-only modal: Claude asks
 // via this tool, ends its turn, and the user's tap arrives as ordinary inbound.
-const pendingAsks = new Map<string, { chat_id: string; question: string; options: string[]; createdAt: number }>()
+const pendingAsks = new Map<string, { chat_id: string; message_id: number; question: string; options: string[]; createdAt: number }>()
+// Hard cap so a burst of unanswered asks can't grow the map without bound
+// (the opportunistic 24h GC only runs on the next ask call).
+const MAX_PENDING_ASKS = 100
+
+// Strip control chars / collapse newlines before tool-supplied question and
+// option text lands in a synthetic inbound `content` or the transcript, so it
+// can't forge channel markup or smear across transcript lines.
+function sanitizeAskText(s: string): string {
+  return s.replace(/[\x00-\x1f\x7f]+/g, ' ').replace(/\s+/g, ' ').trim()
+}
 
 // Receive permission_request from CC → format → send to all allowlisted DMs.
 // Groups are intentionally excluded — the security thread resolution was
@@ -1053,14 +1063,19 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           }
         }
 
-        // Opportunistic GC of stale, never-answered prompts (>24h).
+        // Opportunistic GC of stale, never-answered prompts (>24h), then a
+        // hard-cap eviction of the oldest if we're still at the ceiling.
         const cutoff = Date.now() - 24 * 60 * 60 * 1000
         for (const [k, v] of pendingAsks) {
           if (v.createdAt < cutoff) pendingAsks.delete(k)
         }
+        while (pendingAsks.size >= MAX_PENDING_ASKS) {
+          const oldest = pendingAsks.keys().next().value as string | undefined
+          if (oldest === undefined) break
+          pendingAsks.delete(oldest)
+        }
 
         const askId = randomBytes(4).toString('hex') // 8 hex chars — fits callback_data
-        pendingAsks.set(askId, { chat_id, question, options, createdAt: Date.now() })
 
         // One button per row so arbitrary-length labels render cleanly.
         const keyboard = new InlineKeyboard()
@@ -1074,6 +1089,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           reply_markup: keyboard,
           ...(askParseMode ? { parse_mode: askParseMode } : {}),
         })
+
+        // Register only after the send succeeds — a failed send (which throws
+        // above) must not leave an orphaned pending ask. Bind the message_id so
+        // the callback can verify the tap came from this exact prompt.
+        pendingAsks.set(askId, { chat_id, message_id: sent.message_id, question, options, createdAt: Date.now() })
 
         logOutboundReplyTranscript(
           { chat_id, sent_message_ids: [sent.message_id], format },
@@ -1230,43 +1250,51 @@ bot.on('callback_query:data', async ctx => {
       await ctx.answerCallbackQuery({ text: 'This question has expired.' }).catch(() => {})
       return
     }
+    // Bind the tap to the exact chat + message the ask was sent to — don't
+    // trust ctx.chat for routing the injected answer. A legitimate tap always
+    // comes from entry.message_id in entry.chat_id; anything else is rejected.
+    if (String(ctx.chat?.id) !== entry.chat_id ||
+        ctx.callbackQuery.message?.message_id !== entry.message_id) {
+      await ctx.answerCallbackQuery({ text: 'Stale or mismatched button.' }).catch(() => {})
+      return
+    }
     const label = entry.options[parseInt(idxStr, 10)]
     if (label === undefined) {
       await ctx.answerCallbackQuery({ text: 'Unknown option.' }).catch(() => {})
       return
     }
     pendingAsks.delete(askId)
-    const askChatId = String(ctx.chat?.id ?? entry.chat_id)
-    const askMsgId = ctx.callbackQuery.message?.message_id
+    const askChatId = entry.chat_id
+    const askMsgId = entry.message_id
+    const safeLabel = sanitizeAskText(label)
+    const safeQuestion = sanitizeAskText(entry.question)
 
     await notifyOrQueue({
       method: 'notifications/claude/channel',
       params: {
-        content: `Tapped "${label}" in answer to: ${entry.question}`,
+        content: `Tapped "${safeLabel}" in answer to: ${safeQuestion}`,
         meta: {
           chat_id: askChatId,
-          ...(askMsgId != null ? { message_id: String(askMsgId) } : {}),
+          message_id: String(askMsgId),
           user: ctx.from.username ?? String(ctx.from.id),
           user_id: String(ctx.from.id),
           ts: new Date().toISOString(),
           kind: 'ask_answer',
           ask_request_id: askId,
-          ask_answer: label,
+          ask_answer: safeLabel,
         },
       },
     })
     logInboundTranscript({
       chat_id: askChatId,
-      message_id: askMsgId != null ? String(askMsgId) : undefined,
+      message_id: String(askMsgId),
       user: ctx.from.username ?? String(ctx.from.id),
-    }, `[ask answer] ${label} (to: ${entry.question})`)
+    }, `[ask answer] ${safeLabel} (to: ${safeQuestion})`)
 
     await ctx.answerCallbackQuery({ text: `Sent: ${label}` }).catch(() => {})
     // Replace the buttons with the outcome so it can't be tapped twice and the
     // chat history records the choice.
-    if (askMsgId != null) {
-      await ctx.editMessageText(`${entry.question}\n\n✅ You chose: ${label}`).catch(() => {})
-    }
+    await ctx.editMessageText(`${entry.question}\n\n✅ You chose: ${label}`).catch(() => {})
     return
   }
 
