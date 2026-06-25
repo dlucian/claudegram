@@ -632,6 +632,12 @@ const mcp = new Server(
 // Stores full permission details for "See more" expansion keyed by request_id.
 const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string }>()
 
+// Stores `ask`-tool prompts keyed by a short id so an inline-button tap can be
+// resolved back to its option label and injected as a normal inbound message.
+// The non-blocking answer to AskUserQuestion's terminal-only modal: Claude asks
+// via this tool, ends its turn, and the user's tap arrives as ordinary inbound.
+const pendingAsks = new Map<string, { chat_id: string; question: string; options: string[]; createdAt: number }>()
+
 // Receive permission_request from CC → format → send to all allowlisted DMs.
 // Groups are intentionally excluded — the security thread resolution was
 // "single-user mode for official plugins." Anyone in access.allowFrom
@@ -732,6 +738,32 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
         },
         required: ['chat_id', 'message_id', 'text'],
+      },
+    },
+    {
+      name: 'ask',
+      description:
+        'Ask the user a multiple-choice question on Telegram with tappable inline buttons. NON-BLOCKING: returns immediately after sending — END YOUR TURN; the user\'s tap arrives later as a new inbound channel message (content: `Tapped "<option>" in answer to: <question>`). Do not wait or poll. Use this INSTEAD of AskUserQuestion whenever the user is on Telegram — AskUserQuestion is a terminal-only modal that stalls the channel until someone reaches the terminal. The user can also ignore the buttons and just type a free-text reply.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string' },
+          question: {
+            type: 'string',
+            description: 'The question text. Keep it self-contained — it is echoed back alongside the chosen answer.',
+          },
+          options: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Answer choices, each rendered as its own tappable button (max 8). Keep labels short.',
+          },
+          format: {
+            type: 'string',
+            enum: ['text', 'markdown'],
+            description: "Rendering mode for the question text. 'markdown' escapes for you; 'text' (default) is plain.",
+          },
+        },
+        required: ['chat_id', 'question', 'options'],
       },
     },
   ],
@@ -997,6 +1029,67 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
         return { content: [{ type: 'text', text: `edited (id: ${id})` }] }
       }
+      case 'ask': {
+        const chat_id = args.chat_id as string
+        const question = args.question as string
+        const options = args.options as string[]
+        const format = (args.format as string | undefined) ?? 'text'
+
+        assertAllowedChat(chat_id)
+
+        if (!Array.isArray(options) || options.length === 0) {
+          throw new Error('ask requires a non-empty options array')
+        }
+        if (options.length > 8) {
+          throw new Error(`ask supports at most 8 options (got ${options.length})`)
+        }
+        for (const o of options) {
+          if (typeof o !== 'string' || o.length === 0) {
+            throw new Error('each option must be a non-empty string')
+          }
+          // Telegram button labels should stay short; cap defensively.
+          if (Buffer.byteLength(o, 'utf8') > 120) {
+            throw new Error(`option label too long for a button: "${o.slice(0, 30)}…"`)
+          }
+        }
+
+        // Opportunistic GC of stale, never-answered prompts (>24h).
+        const cutoff = Date.now() - 24 * 60 * 60 * 1000
+        for (const [k, v] of pendingAsks) {
+          if (v.createdAt < cutoff) pendingAsks.delete(k)
+        }
+
+        const askId = randomBytes(4).toString('hex') // 8 hex chars — fits callback_data
+        pendingAsks.set(askId, { chat_id, question, options, createdAt: Date.now() })
+
+        // One button per row so arbitrary-length labels render cleanly.
+        const keyboard = new InlineKeyboard()
+        options.forEach((opt, i) => {
+          keyboard.text(opt, `ask:${askId}:${i}`).row()
+        })
+
+        const questionToSend = format === 'markdown' ? tgMdEscape(question) : question
+        const askParseMode = format === 'markdown' ? 'MarkdownV2' as const : undefined
+        const sent = await bot.api.sendMessage(chat_id, questionToSend, {
+          reply_markup: keyboard,
+          ...(askParseMode ? { parse_mode: askParseMode } : {}),
+        })
+
+        logOutboundReplyTranscript(
+          { chat_id, sent_message_ids: [sent.message_id], format },
+          `[ask] ${question} — options: ${options.join(' | ')}`,
+        )
+
+        return {
+          content: [{
+            type: 'text',
+            text:
+              `Question sent to Telegram with ${options.length} inline buttons (msg id: ${sent.message_id}). ` +
+              `NON-BLOCKING — end your turn now. The user's tap (or a typed reply) will arrive as a new ` +
+              `inbound channel message; do not wait or poll.`,
+          }],
+        }
+      }
       default:
         return {
           content: [{ type: 'text', text: `unknown tool: ${req.params.name}` }],
@@ -1118,6 +1211,65 @@ bot.command('status', async ctx => {
 // Security mirrors the text-reply path: allowFrom must contain the sender.
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
+
+  // `ask`-tool answer. Callback data: ask:<id>:<idx>. Resolve the option label
+  // and inject it as a normal inbound message so Claude picks it up
+  // non-blocking, exactly as if the user had typed the answer. Security mirrors
+  // the permission path: the sender must be in allowFrom.
+  const askM = /^ask:([0-9a-f]{8}):(\d+)$/.exec(data)
+  if (askM) {
+    const [, askId, idxStr] = askM
+    const askAccess = loadAccess()
+    const askSenderId = String(ctx.from.id)
+    if (!askAccess.allowFrom.includes(askSenderId)) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+      return
+    }
+    const entry = pendingAsks.get(askId)
+    if (!entry) {
+      await ctx.answerCallbackQuery({ text: 'This question has expired.' }).catch(() => {})
+      return
+    }
+    const label = entry.options[parseInt(idxStr, 10)]
+    if (label === undefined) {
+      await ctx.answerCallbackQuery({ text: 'Unknown option.' }).catch(() => {})
+      return
+    }
+    pendingAsks.delete(askId)
+    const askChatId = String(ctx.chat?.id ?? entry.chat_id)
+    const askMsgId = ctx.callbackQuery.message?.message_id
+
+    await notifyOrQueue({
+      method: 'notifications/claude/channel',
+      params: {
+        content: `Tapped "${label}" in answer to: ${entry.question}`,
+        meta: {
+          chat_id: askChatId,
+          ...(askMsgId != null ? { message_id: String(askMsgId) } : {}),
+          user: ctx.from.username ?? String(ctx.from.id),
+          user_id: String(ctx.from.id),
+          ts: new Date().toISOString(),
+          kind: 'ask_answer',
+          ask_request_id: askId,
+          ask_answer: label,
+        },
+      },
+    })
+    logInboundTranscript({
+      chat_id: askChatId,
+      message_id: askMsgId != null ? String(askMsgId) : undefined,
+      user: ctx.from.username ?? String(ctx.from.id),
+    }, `[ask answer] ${label} (to: ${entry.question})`)
+
+    await ctx.answerCallbackQuery({ text: `Sent: ${label}` }).catch(() => {})
+    // Replace the buttons with the outcome so it can't be tapped twice and the
+    // chat history records the choice.
+    if (askMsgId != null) {
+      await ctx.editMessageText(`${entry.question}\n\n✅ You chose: ${label}`).catch(() => {})
+    }
+    return
+  }
+
   const m = /^perm:(allow|deny|more):([a-km-z]{5})$/.exec(data)
   if (!m) {
     await ctx.answerCallbackQuery().catch(() => {})
