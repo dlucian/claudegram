@@ -916,7 +916,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const text = args.text as string
         const reply_to = args.reply_to != null ? Number(args.reply_to) : undefined
         const files = (args.files as string[] | undefined) ?? []
-        const format = (args.format as string | undefined) ?? 'text'
+        // Default to 'markdown' (ezri): the escaper (tgMdEscape, patch 009) makes
+        // plain prose render identically while *bold*/`code`/[links] just work, so
+        // callers no longer have to remember a flag — this was the intent of patch
+        // 009 ("the right path is the only path"), the default flip just finishes it.
+        // Safe because the send loop below falls back to plain text on any parse
+        // error, so markdown-default can never DROP a reply (reliability first).
+        const format = (args.format as string | undefined) ?? 'markdown'
         const textToSend = format === 'markdown' ? tgMdEscape(text) : text
         const parseMode = (format === 'markdownv2' || format === 'markdown') ? 'MarkdownV2' as const : undefined
 
@@ -943,10 +949,28 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
               reply_to != null &&
               replyMode !== 'off' &&
               (replyMode === 'all' || i === 0)
-            const sent = await bot.api.sendMessage(chat_id, chunks[i], {
-              ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
-              ...(parseMode ? { parse_mode: parseMode } : {}),
-            })
+            const replyParams = shouldReplyTo
+              ? { reply_parameters: { message_id: reply_to as number } }
+              : {}
+            let sent
+            try {
+              sent = await bot.api.sendMessage(chat_id, chunks[i], {
+                ...replyParams,
+                ...(parseMode ? { parse_mode: parseMode } : {}),
+              })
+            } catch (sendErr) {
+              // ezri: never DROP a reply over a formatting issue — Telegram
+              // reliability is the top priority. If the parser rejects the entities
+              // (a 400 "can't parse entities"), resend the SAME chunk as plain text
+              // so the user still gets the content (raw markers beat silence). Only
+              // catch parse errors here; anything else (chat not found, network)
+              // propagates to the outer catch unchanged.
+              const em = sendErr instanceof Error ? sendErr.message : String(sendErr)
+              if (parseMode == null || !/can't parse entities|parse entities/i.test(em)) {
+                throw sendErr
+              }
+              sent = await bot.api.sendMessage(chat_id, chunks[i], { ...replyParams })
+            }
             sentIds.push(sent.message_id)
           }
         } catch (err) {
