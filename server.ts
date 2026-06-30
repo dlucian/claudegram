@@ -817,8 +817,14 @@ function tgNormaliseCommonmark(s: string): string {
   return masked
 }
 
-function tgMdEscape(input: string): string {
-  const s = tgNormaliseCommonmark(input)
+// Render tokenised Markdown, recursing into emphasis bodies. Telegram
+// MarkdownV2 permits nested entities (a link inside bold: *[text](url)*), so an
+// emphasis body is rendered recursively rather than flattened to escaped plain
+// text — otherwise the nested link's [ ]( ) get escaped and render literally
+// (the 2026-06-30 bold-link bug). Recursion terminates: each level strips the
+// outer delimiters, so the body is strictly shorter. Code bodies are NOT
+// recursed (their contents are literal).
+function tgMdRender(s: string): string {
   let i = 0
   const n = s.length
   let out = ''
@@ -862,7 +868,7 @@ function tgMdEscape(input: string): string {
       const m = s.slice(i).match(/^__([^_\n]+?)__/)
       if (m) {
         flushPlain()
-        out += '__' + tgEsc(m[1], TG_MD_RESERVED) + '__'
+        out += '__' + tgMdRender(m[1]) + '__'
         i += m[0].length
         continue
       }
@@ -872,7 +878,7 @@ function tgMdEscape(input: string): string {
       if (!m) m = s.slice(i).match(/^\*([^*\n\s])\*/)
       if (m && !m[1].startsWith(' ')) {
         flushPlain()
-        out += '*' + tgEsc(m[1], TG_MD_RESERVED) + '*'
+        out += '*' + tgMdRender(m[1]) + '*'
         i += m[0].length
         continue
       }
@@ -884,7 +890,7 @@ function tgMdEscape(input: string): string {
         const endPos = i + m[0].length
         if (endPos === n || !/[a-zA-Z0-9]/.test(s[endPos])) {
           flushPlain()
-          out += '_' + tgEsc(m[1], TG_MD_RESERVED) + '_'
+          out += '_' + tgMdRender(m[1]) + '_'
           i += m[0].length
           continue
         }
@@ -895,7 +901,7 @@ function tgMdEscape(input: string): string {
       if (!m) m = s.slice(i).match(/^~([^~\n\s])~/)
       if (m) {
         flushPlain()
-        out += '~' + tgEsc(m[1], TG_MD_RESERVED) + '~'
+        out += '~' + tgMdRender(m[1]) + '~'
         i += m[0].length
         continue
       }
@@ -905,6 +911,10 @@ function tgMdEscape(input: string): string {
   }
   flushPlain()
   return out
+}
+
+function tgMdEscape(input: string): string {
+  return tgMdRender(tgNormaliseCommonmark(input))
 }
 
 mcp.setRequestHandler(CallToolRequestSchema, async req => {
