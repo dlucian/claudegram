@@ -801,8 +801,25 @@ function tgEsc(s: string, reserved: Set<string>): string {
   return out
 }
 
+// Obsidian wiki-refs → tappable o.daniliuc.com links. `[[Note Name]]` becomes
+// [Note Name](https://o.daniliuc.com/<url-encoded name>); `[[Note|Alias]]` uses
+// Alias as the visible text but links the note. Diacritics/spaces via
+// encodeURIComponent; parens encoded too so the generated URL survives the
+// [text](url) parser (which stops at a raw ')'). Vault refs are untappable
+// plain text on mobile otherwise — this bakes in the "never raw [[wiki-links]]"
+// convention so every markdown message gets it for free.
+const OBSIDIAN_REDIRECTOR = 'https://o.daniliuc.com/'
+function tgConvertWikiLinks(s: string): string {
+  return s.replace(/\[\[([^\[\]\n|]+?)(?:\|([^\[\]\n|]+?))?\]\]/g, (_m, target: string, alias?: string) => {
+    const note = target.trim()
+    const text = (alias ?? target).trim()
+    const url = OBSIDIAN_REDIRECTOR + encodeURIComponent(note).replace(/[()]/g, c => (c === '(' ? '%28' : '%29'))
+    return `[${text}](${url})`
+  })
+}
+
 function tgNormaliseCommonmark(s: string): string {
-  // **bold** → *bold*, but not inside code regions.
+  // **bold** → *bold* and [[wiki]] → o.daniliuc.com links, but not inside code regions.
   const masks: string[] = []
   const stash = (m: string): string => {
     masks.push(m)
@@ -810,6 +827,7 @@ function tgNormaliseCommonmark(s: string): string {
   }
   let masked = s.replace(/```[\s\S]*?```/g, stash)
   masked = masked.replace(/`[^`\n]+`/g, stash)
+  masked = tgConvertWikiLinks(masked)
   masked = masked.replace(/\*\*(\S(?:.*?\S)?)\*\*/g, '*$1*')
   masks.forEach((orig, i) => {
     masked = masked.replace(`[TGMASK${i}]`, orig)
