@@ -636,7 +636,7 @@ const pendingPermissions = new Map<string, { tool_name: string; description: str
 // resolved back to its option label and injected as a normal inbound message.
 // The non-blocking answer to AskUserQuestion's terminal-only modal: Claude asks
 // via this tool, ends its turn, and the user's tap arrives as ordinary inbound.
-const pendingAsks = new Map<string, { chat_id: string; message_id: number; question: string; options: string[]; createdAt: number }>()
+const pendingAsks = new Map<string, { chat_id: string; message_id: number; question: string; options: string[]; format: string; createdAt: number }>()
 // Hard cap so a burst of unanswered asks can't grow the map without bound
 // (the opportunistic 24h GC only runs on the next ask call).
 const MAX_PENDING_ASKS = 100
@@ -1117,8 +1117,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           keyboard.text(opt, `ask:${askId}:${i}`).row()
         })
 
+        // 'markdown' → auto-escape; 'markdownv2' → caller hand-escaped; both render as MarkdownV2.
         const questionToSend = format === 'markdown' ? tgMdEscape(question) : question
-        const askParseMode = format === 'markdown' ? 'MarkdownV2' as const : undefined
+        const askParseMode = (format === 'markdown' || format === 'markdownv2') ? 'MarkdownV2' as const : undefined
         const sent = await bot.api.sendMessage(chat_id, questionToSend, {
           reply_markup: keyboard,
           ...(askParseMode ? { parse_mode: askParseMode } : {}),
@@ -1127,7 +1128,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         // Register only after the send succeeds — a failed send (which throws
         // above) must not leave an orphaned pending ask. Bind the message_id so
         // the callback can verify the tap came from this exact prompt.
-        pendingAsks.set(askId, { chat_id, message_id: sent.message_id, question, options, createdAt: Date.now() })
+        pendingAsks.set(askId, { chat_id, message_id: sent.message_id, question, options, format, createdAt: Date.now() })
 
         logOutboundReplyTranscript(
           { chat_id, sent_message_ids: [sent.message_id], format },
@@ -1327,8 +1328,17 @@ bot.on('callback_query:data', async ctx => {
 
     await ctx.answerCallbackQuery({ text: `Sent: ${label}` }).catch(() => {})
     // Replace the buttons with the outcome so it can't be tapped twice and the
-    // chat history records the choice.
-    await ctx.editMessageText(`${entry.question}\n\n✅ You chose: ${label}`).catch(() => {})
+    // chat history records the choice. Re-render with the SAME format the
+    // original question used — otherwise a markdown ask loses its formatting on
+    // the confirmation edit (raw *bold* / `code` / [[links]] leak through).
+    const askIsMd = entry.format === 'markdown' || entry.format === 'markdownv2'
+    if (askIsMd) {
+      const q = entry.format === 'markdown' ? tgMdEscape(entry.question) : entry.question
+      const l = entry.format === 'markdown' ? tgMdEscape(label) : label
+      await ctx.editMessageText(`${q}\n\n✅ You chose: ${l}`, { parse_mode: 'MarkdownV2' }).catch(() => {})
+    } else {
+      await ctx.editMessageText(`${entry.question}\n\n✅ You chose: ${label}`).catch(() => {})
+    }
     return
   }
 
