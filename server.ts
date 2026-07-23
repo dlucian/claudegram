@@ -22,7 +22,7 @@ import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, appendFileSync, existsSync } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
-import { execSync } from 'child_process'
+import { execSync, spawn } from 'child_process'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -827,8 +827,8 @@ function tgNormaliseCommonmark(s: string): string {
   }
   let masked = s.replace(/```[\s\S]*?```/g, stash)
   masked = masked.replace(/`[^`\n]+`/g, stash)
-  masked = tgConvertWikiLinks(masked)
   masked = masked.replace(/\*\*(\S(?:.*?\S)?)\*\*/g, '*$1*')
+  masked = tgConvertWikiLinks(masked)
   masks.forEach((orig, i) => {
     masked = masked.replace(`[TGMASK${i}]`, orig)
   })
@@ -1135,8 +1135,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           keyboard.text(opt, `ask:${askId}:${i}`).row()
         })
 
-        // 'markdown' → auto-escape; 'markdownv2' → caller hand-escaped; both render as MarkdownV2.
         const questionToSend = format === 'markdown' ? tgMdEscape(question) : question
+        // 'markdown' → auto-escape; 'markdownv2' → caller hand-escaped; both render as MarkdownV2.
         const askParseMode = (format === 'markdown' || format === 'markdownv2') ? 'MarkdownV2' as const : undefined
         const sent = await bot.api.sendMessage(chat_id, questionToSend, {
           reply_markup: keyboard,
@@ -1312,6 +1312,37 @@ bot.command('compact', async ctx => {
       .trim()
       .slice(0, 300)
     await ctx.reply(`⚠️ Couldn't fire /compact: ${detail || 'unknown error'}`)
+  }
+})
+
+// /clear — plugin-caught operator command (ezri-specific). Rotates the live
+// session to a fresh transcript via `ezri-rotate-session` (exits + relaunches
+// claude in this pane), which is the ONLY thing that starts a new context (a
+// bare /clear/compact keep the same session). The rotation TEARS DOWN this very
+// process tree (it kills claude in the pane → this bun child would die with it),
+// so we (1) reply FIRST, then (2) spawn it DETACHED (detached:true → new session
+// leader, reparented to init) so it survives the teardown and completes the
+// relaunch. ezri-rotate-session has its own idle gate — it only rotates from an
+// idle ⏵⏵ prompt and skips (harmlessly) if the session is mid-task, so this
+// can't interrupt live work. dmCommandGate restricts it to the paired operator.
+// Like the others it terminates the chain → never reaches the session inbox.
+// (Ezri patch 014.)
+bot.command('clear', async ctx => {
+  if (!dmCommandGate(ctx)) return
+  const script = join(homedir(), 'ezri', 'bin', 'ezri-rotate-session')
+  // Reply BEFORE firing — the rotation may take down this process before a
+  // later reply could send.
+  await ctx.reply(`🔄 Rotating to a fresh session (when the pane's idle) — back in a moment.`)
+  try {
+    const child = spawn(script, [], {
+      detached: true,
+      stdio: 'ignore',
+      env: process.env,
+    })
+    child.unref()
+  } catch (err: any) {
+    const detail = String(err?.message || err).trim().slice(0, 300)
+    await ctx.reply(`⚠️ Couldn't start the rotation: ${detail || 'unknown error'}`)
   }
 })
 
@@ -1731,7 +1762,12 @@ bot.on('message_reaction', async ctx => {
   const reaction = ctx.update.message_reaction
   if (!reaction) return
   const emojiOf = (r: { type: string }): string | null =>
-    r.type === 'emoji' ? ((r as { type: 'emoji'; emoji: string }).emoji) : null
+    r.type === 'emoji' ? ((r as { type: 'emoji'; emoji: string }).emoji)
+    // Custom (Premium) emoji reactions carry an opaque id, not a unicode char.
+    // Forward a marker so they are never silently dropped — the user's signal
+    // still reaches the session (approval is interpreted by Ezri, not by exact
+    // emoji), which is the point of "whitelist all the emojis" (2026-07-02).
+    : r.type === 'custom_emoji' ? '⭐' : null
   const oldEmojis = (reaction.old_reaction ?? []).map(emojiOf).filter((e): e is string => e !== null)
   const newEmojis = (reaction.new_reaction ?? []).map(emojiOf).filter((e): e is string => e !== null)
   const added = newEmojis.filter(e => !oldEmojis.includes(e))
@@ -1845,6 +1881,23 @@ async function handleInbound(
 
   const imagePath = downloadImage ? await downloadImage() : undefined
 
+  // ezri#100: surface the quote-reply target so the live session can resolve
+  // WHICH message a reply refers to — critical for off-session (cron/launchd)
+  // messages the session never sent and can't otherwise identify. We forward
+  // Telegram's reply_to_message id (looked up in the outbound ledger) plus a
+  // short sanitized text excerpt for immediate context.
+  const repliedTo = ctx.message?.reply_to_message
+  const replyToMeta = repliedTo
+    ? {
+        reply_to_message_id: String(repliedTo.message_id),
+        // Sanitize like other user-controlled meta (cf. venue_*): strip chars
+        // that could break/forge the rendered <channel> attributes.
+        ...(('text' in repliedTo && repliedTo.text)
+          ? { reply_to_excerpt: String(repliedTo.text).slice(0, 160).replace(/[<>\[\]\r\n;"]/g, ' ') }
+          : {}),
+      }
+    : {}
+
   // image_path goes in meta only — an in-content "[image attached — read: PATH]"
   // annotation is forgeable by any allowlisted sender typing that string.
   await notifyOrQueue({
@@ -1865,6 +1918,7 @@ async function handleInbound(
           ...(attachment.mime ? { attachment_mime: attachment.mime } : {}),
           ...(attachment.name ? { attachment_name: attachment.name } : {}),
         } : {}),
+        ...replyToMeta,
         ...(extraMeta ?? {}),
       },
     },
@@ -1981,6 +2035,7 @@ void (async () => {
               { command: 'help', description: 'What this bot can do' },
               { command: 'status', description: 'Check your pairing status' },
               { command: 'compact', description: 'Compact the session now' },
+              { command: 'clear', description: 'Rotate to a fresh session' },
             ],
             { scope: { type: 'all_private_chats' } },
           ).catch(() => {})
