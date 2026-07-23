@@ -1279,6 +1279,42 @@ bot.command('status', async ctx => {
   await ctx.reply(`Not paired. Send me a message to get a pairing code.`)
 })
 
+// /compact — plugin-caught operator command (ezri-specific). Fires
+// `ezri-compact-now` (the autocompact watchdog with --force), which pastes
+// /compact+Enter into THIS zellij pane. The plugin runs as a subprocess of the
+// paired Claude Code session, so it inherits ZELLIJ_SESSION_NAME / ZELLIJ_PANE_ID
+// and the watchdog resolves the live pane automatically — no flags needed.
+// Like /start /help /status, this handler terminates the middleware chain (no
+// next()), so /compact never round-trips to the session as a message: it's
+// caught here and answered instantly. dmCommandGate restricts it to the paired
+// operator. (Ezri patch 012.)
+bot.command('compact', async ctx => {
+  if (!dmCommandGate(ctx)) return
+  const script = join(homedir(), 'ezri', 'bin', 'ezri-compact-now')
+  try {
+    const out = execSync(script, { encoding: 'utf8', timeout: 20000 }).trim()
+    let fired = true
+    let reason = ''
+    try {
+      const j = JSON.parse(out)
+      fired = j.fired !== false
+      reason = j.reason ?? j.skip_reason ?? ''
+    } catch {
+      // Non-JSON stdout — treat a clean exit (0) as fired.
+    }
+    await ctx.reply(
+      fired
+        ? `🧹 Compacting now — fired /compact at the session.`
+        : `⚠️ /compact not fired${reason ? `: ${reason}` : ' (pane not ready — e.g. at a prompt).'}`,
+    )
+  } catch (err: any) {
+    const detail = String(err?.stderr || err?.stdout || err?.message || err)
+      .trim()
+      .slice(0, 300)
+    await ctx.reply(`⚠️ Couldn't fire /compact: ${detail || 'unknown error'}`)
+  }
+})
+
 // Inline-button handler for permission requests. Callback data is
 // `perm:allow:<id>`, `perm:deny:<id>`, or `perm:more:<id>`.
 // Security mirrors the text-reply path: allowFrom must contain the sender.
@@ -1944,6 +1980,7 @@ void (async () => {
               { command: 'start', description: 'Welcome and setup guide' },
               { command: 'help', description: 'What this bot can do' },
               { command: 'status', description: 'Check your pairing status' },
+              { command: 'compact', description: 'Compact the session now' },
             ],
             { scope: { type: 'all_private_chats' } },
           ).catch(() => {})
