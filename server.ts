@@ -1751,6 +1751,85 @@ bot.on('message:venue', async ctx => {
   })
 })
 
+// Terminal catch-all for message types with no handler above (ezri#150).
+//
+// Every registration above matches ONE message type. Anything outside that
+// list was dropped with no relay to the session and no log line, so neither
+// end could detect it: Telegram showed the message delivered to the bot, and
+// nothing here recorded that it arrived. Two kingfisher digests forwarded on
+// 2026-08-11 vanished that way. They are sent as `rich_message`, so a forward
+// of one carries no `text` field and `message:text` never matched.
+//
+// A degraded relay beats a silent drop. Telegram keeps adding message types,
+// and this box cannot chase every one.
+//
+// grammY runs middleware in registration order and none of the typed handlers
+// calls next(), so this only ever sees what they did not match. It MUST stay
+// last among the `message` handlers.
+
+// The envelope, present on every message regardless of payload. Subtracting
+// these from the message's own keys leaves the field that names the type.
+const MESSAGE_ENVELOPE_KEYS = new Set([
+  'message_id', 'message_thread_id', 'from', 'sender_chat', 'sender_boost_count',
+  'date', 'chat', 'forward_origin', 'forward_from', 'forward_from_chat',
+  'forward_from_message_id', 'forward_signature', 'forward_sender_name',
+  'forward_date', 'is_topic_message', 'is_automatic_forward', 'reply_to_message',
+  'external_reply', 'quote', 'via_bot', 'edit_date', 'has_protected_content',
+  'is_from_offline', 'media_group_id', 'author_signature', 'entities',
+  'caption_entities', 'link_preview_options', 'effect_id', 'reply_markup',
+  'business_connection_id', 'sender_business_bot',
+])
+
+function describeUnhandledMessage(msg: Record<string, unknown>): string {
+  const payloadKeys = Object.keys(msg).filter(k => !MESSAGE_ENVELOPE_KEYS.has(k))
+  return payloadKeys.length > 0 ? payloadKeys.join(', ') : 'unknown'
+}
+
+// Pure, so it can be exercised without a bot: given a raw message, decide what
+// the session is told. Say what was LOST, not just that something was. A body
+// that survived is relayed verbatim; a body that did not is named as absent,
+// so the session asks rather than answering around a gap it cannot see.
+export function composeUnhandledRelay(msg: Record<string, unknown>): { kind: string; text: string } {
+  const kind = describeUnhandledMessage(msg)
+
+  const caption = typeof msg.caption === 'string' ? msg.caption : ''
+  const text = typeof msg.text === 'string' ? msg.text : ''
+  const body = (caption || text).trim()
+
+  const origin = msg.forward_origin as Record<string, unknown> | undefined
+  let forwarded = ''
+  if (origin) {
+    const who =
+      typeof origin.sender_user_name === 'string' ? origin.sender_user_name
+      : (origin.sender_user as Record<string, unknown> | undefined)?.username
+      ?? (origin.chat as Record<string, unknown> | undefined)?.title
+      ?? (origin.sender_chat as Record<string, unknown> | undefined)?.title
+    forwarded = who ? ` forwarded from ${String(who).replace(/[<>\[\]\r\n;"]/g, '_')}` : ' forwarded'
+  }
+
+  return {
+    kind,
+    text: body
+      ? `(unhandled message type: ${kind}${forwarded})\n\n${body}`
+      : `(unhandled message type: ${kind}${forwarded} — no text body reached the bot)`,
+  }
+}
+
+bot.on('message', async ctx => {
+  try {
+    const msg = ctx.message as unknown as Record<string, unknown>
+    const { kind, text } = composeUnhandledRelay(msg)
+
+    // Diagnosable rather than invisible: the next unknown type shows up here.
+    console.error(`[unhandled-message] type=${kind} chat=${ctx.chat?.id} message_id=${ctx.message?.message_id}`)
+
+    await handleInbound(ctx, text, undefined, undefined, { unhandled_type: kind })
+  } catch (err) {
+    // A throw here would be the very silence this handler exists to end.
+    console.error('[unhandled-message] relay failed:', err instanceof Error ? err.message : err)
+  }
+})
+
 // Inbound emoji reactions on bot messages. Surfaces the user's reaction as a
 // channel notification so an AFK user can ack with 👍 / ✅ / 1️⃣ etc instead
 // of typing a reply. Filtered to emoji reactions only — custom emoji and
