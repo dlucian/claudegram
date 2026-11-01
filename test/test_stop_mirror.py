@@ -166,6 +166,43 @@ def test_secret_scrub():
     assert "***REDACTED***" in out
 
 
+def test_mirror_only_turns_opened_by_lucian_on_telegram(tmp_path):
+    """dlucian/ezri 2026-11-01: turns opened by task-notifications mirrored
+    status lines to Telegram ("all the tool calls are still being sent to
+    Telegram, so I have even more noise"). Only a turn that answers a
+    Telegram message from Lucian mirrors."""
+    tg = '<channel source="plugin:telegram:telegram" chat_id="1" message_id="2">hi</channel>'
+    react = tg.replace('message_id="2"', 'message_id="3" kind="reaction"')
+    notif = "<task-notification><task-id>x</task-id></task-notification>"
+    queued = lambda t: {"type": "attachment",
+                        "attachment": {"type": "queued_command", "prompt": t}}
+    midturn = {"type": "user", "message": {"content": [{"type": "tool_result",
+               "content": "A message arrived ... " + tg}]}}
+    own_code = {"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "input": {"x": tg}}]}}
+    done = _assistant_text("Done, here is the answer.")
+    cases = {
+        "telegram prompt": ([_user_str(tg), done], True),
+        "reaction only": ([_user_str(react), done], False),
+        "notification": ([_user_str(notif), done], False),
+        "telegram, then a later notification turn": (
+            [_user_str(tg), done, _user_str(notif), done], False),
+        "notification, then a queued telegram message": (
+            [_user_str(notif), done, queued(tg), done], True),
+        "telegram, then a queued reaction": (
+            [_user_str(tg), done, queued(react), done], True),
+        "notification, then a queued reaction": (
+            [_user_str(notif), done, queued(react), done], False),
+        "telegram message embedded mid-turn in a tool result": (
+            [_user_str(notif), midturn, done], True),
+        "Ezri's own tool input quoting the tag": (
+            [_user_str(notif), own_code, done], False),
+    }
+    for name, (records, want) in cases.items():
+        tp = _write_transcript(tmp_path, records)
+        assert m.turn_started_by_lucian_on_telegram(tp) is want, name
+
+
 if __name__ == "__main__":
     import inspect
     import traceback

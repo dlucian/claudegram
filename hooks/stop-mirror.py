@@ -16,6 +16,8 @@ Skip conditions:
   - EZRI_TG_MIRROR=0 (env var kill switch)
   - Session is not in the ezri project (marker derived from ~/ezri)
   - The Telegram channel is inactive in this session (terminal-only launch)
+  - The turn was not opened by an inbound Telegram message from Lucian
+    (task-notifications, wakeups, and harness nudges stay in the terminal)
   - The last assistant turn already called a Telegram reply/edit tool
   - Final text is empty, < 12 chars, or pure tool-narration sentinel
 
@@ -290,6 +292,125 @@ def send_telegram(text: str, reply_to: str | None = None) -> tuple[bool, str]:
     return False, f"{last} (after 3 attempts)"
 
 
+def _turn_start(lines: list) -> int:
+    """Index of the record that opened the current turn (see collect_turn)."""
+    turn_start = 0
+    for i in range(len(lines) - 1, -1, -1):
+        try:
+            d = json.loads(lines[i])
+        except Exception:
+            continue
+        rec_type = d.get("type")
+        if rec_type == "attachment":
+            att = d.get("attachment") or {}
+            if att.get("type") == "queued_command":
+                turn_start = i
+                break
+            continue
+        if rec_type != "user":
+            continue
+        msg = d.get("message") or {}
+        content = msg.get("content")
+        if isinstance(content, str):
+            turn_start = i
+            break
+        if isinstance(content, list):
+            if not any(
+                isinstance(b, dict) and b.get("type") == "tool_result"
+                for b in content
+            ):
+                turn_start = i
+                break
+    return turn_start
+
+
+TELEGRAM_INBOUND = '<channel source="plugin:telegram:telegram"'
+
+
+def _record_text(d: dict) -> str:
+    """All text in a turn-opening record: a user prompt (string or text
+    blocks) or a queued_command attachment's prompt."""
+    if d.get("type") == "attachment":
+        att = d.get("attachment") or {}
+        prompt = att.get("prompt")
+        if isinstance(prompt, str):
+            return prompt
+        if isinstance(prompt, list):
+            return " ".join(
+                b.get("text") or "" for b in prompt if isinstance(b, dict)
+            )
+        return json.dumps(att)
+    content = (d.get("message") or {}).get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            b.get("text") or "" for b in content
+            if isinstance(b, dict) and b.get("type") == "text"
+        )
+    return ""
+
+
+def _has_non_reaction_inbound(raw: str) -> bool:
+    """True when raw text (possibly JSON-escaped) holds a Telegram inbound
+    tag that isn't a reaction."""
+    text = raw.replace('\\"', '"')
+    idx = text.find(TELEGRAM_INBOUND)
+    while idx != -1:
+        if 'kind="reaction"' not in text[idx:].split(">", 1)[0]:
+            return True
+        idx = text.find(TELEGRAM_INBOUND, idx + 1)
+    return False
+
+
+def turn_started_by_lucian_on_telegram(transcript_path: Path) -> bool:
+    """True only when the current turn was opened by an inbound Telegram
+    message from Lucian, not a reaction.
+
+    Turns opened by a background task-notification, a scheduled wakeup, or a
+    harness nudge are Ezri's own housekeeping. Mirroring their closing text
+    is what flooded the chat with status lines (2026-09-26, 10-07, 10-21, and
+    Lucian 2026-11-01: "all the tool calls are still being sent to Telegram,
+    so I have even more noise"). The safety net the mirror exists for, a
+    reply to a Telegram question written only in the terminal, is still
+    covered, because that turn is opened by the Telegram message."""
+    if not transcript_path.exists():
+        return False
+    lines = transcript_path.read_text().splitlines()
+    # A message Lucian sends while a turn is busy can also arrive embedded in
+    # a tool result ("A message arrived from plugin:telegram ... while you were
+    # working"). That turn is answering him too.
+    # Only user-side records count: Ezri's own assistant text and tool inputs
+    # can quote the tag (as this hook's own source does).
+    for line in lines[_turn_start(lines):]:
+        try:
+            if json.loads(line).get("type") not in ("user", "attachment"):
+                continue
+        except Exception:
+            continue
+        if _has_non_reaction_inbound(line):
+            return True
+    end = len(lines)
+    while end > 0:
+        start = _turn_start(lines[:end])
+        try:
+            text = _record_text(json.loads(lines[start]))
+        except Exception:
+            return False
+        if TELEGRAM_INBOUND not in text:
+            return False
+        # A reaction (kind="reaction") is an acknowledgement, not a question.
+        # One that lands mid-turn arrives as its own queued_command boundary,
+        # so look past it to whatever opened the turn before it.
+        opening = text[text.index(TELEGRAM_INBOUND):].split(">", 1)[0]
+        if 'kind="reaction"' not in opening:
+            return True
+        if start == 0:
+            return False
+        end = start
+    return False
+
+
 def main() -> int:
     if os.environ.get("EZRI_TG_MIRROR") == "0":
         log("disabled by env")
@@ -317,6 +438,10 @@ def main() -> int:
 
     if payload.get("stop_hook_active"):
         return 0  # prevent infinite re-entry
+
+    if not turn_started_by_lucian_on_telegram(Path(transcript_path)):
+        log("turn not opened by a Telegram message from Lucian — skip mirror")
+        return 0
 
     assistants, final_text, trigger = collect_turn(Path(transcript_path))
     # Transcript-write race guard: re-read briefly if the turn isn't settled.
