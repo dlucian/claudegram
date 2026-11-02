@@ -23,6 +23,7 @@ import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, 
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
 import { execSync, spawn } from 'child_process'
+import { formatPermissionPrompt } from './permission-format.ts'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -666,15 +667,24 @@ mcp.setNotificationHandler(
     const { request_id, tool_name, description, input_preview } = params
     pendingPermissions.set(request_id, { tool_name, description, input_preview })
     const access = loadAccess()
-    const text = `🔐 Permission: ${tool_name}`
+    // The notification carries only request_id, tool_name, description and
+    // input_preview: no agent name and no parser warning, so none is shown.
+    const prompt = formatPermissionPrompt({ tool_name, description, input_preview })
     const keyboard = new InlineKeyboard()
-      .text('See more', `perm:more:${request_id}`)
-      .text('✅ Allow', `perm:allow:${request_id}`)
-      .text('❌ Deny', `perm:deny:${request_id}`)
+    if (prompt.truncated) keyboard.text('See more', `perm:more:${request_id}`)
+    keyboard.text('✅ Allow', `perm:allow:${request_id}`).text('❌ Deny', `perm:deny:${request_id}`)
     for (const chat_id of access.allowFrom) {
-      void bot.api.sendMessage(chat_id, text, { reply_markup: keyboard }).catch(e => {
-        process.stderr.write(`permission_request send to ${chat_id} failed: ${e}\n`)
-      })
+      void bot.api
+        .sendMessage(chat_id, prompt.html, { parse_mode: 'HTML', reply_markup: keyboard })
+        .catch(async e => {
+          // Never let a prompt go missing over markup: resend the plain-text
+          // rendering (not the HTML string) with the same buttons.
+          process.stderr.write(`permission_request HTML send to ${chat_id} failed, retrying as plain text: ${e}\n`)
+          await bot.api.sendMessage(chat_id, prompt.plain, { reply_markup: keyboard })
+        })
+        .catch(e => {
+          process.stderr.write(`permission_request send to ${chat_id} failed: ${e}\n`)
+        })
     }
   },
 )
@@ -1446,22 +1456,36 @@ bot.on('callback_query:data', async ctx => {
       await ctx.answerCallbackQuery({ text: 'Details no longer available.' }).catch(() => {})
       return
     }
-    const { tool_name, description, input_preview } = details
-    let prettyInput: string
-    try {
-      prettyInput = JSON.stringify(JSON.parse(input_preview), null, 2)
-    } catch {
-      prettyInput = input_preview
-    }
-    const expanded =
-      `🔐 Permission: ${tool_name}\n\n` +
-      `tool_name: ${tool_name}\n` +
-      `description: ${description}\n` +
-      `input_preview:\n${prettyInput}`
+    const full = formatPermissionPrompt(details)
     const keyboard = new InlineKeyboard()
       .text('✅ Allow', `perm:allow:${request_id}`)
       .text('❌ Deny', `perm:deny:${request_id}`)
-    await ctx.editMessageText(expanded, { reply_markup: keyboard }).catch(() => {})
+    // First part replaces the prompt (buttons stay on it); any remainder goes
+    // out as follow-up messages. Each part is independently valid HTML, and
+    // each falls back to its plain-text twin if Telegram rejects the markup.
+    await ctx
+      .editMessageText(full.fullHtmlParts[0], { parse_mode: 'HTML', reply_markup: keyboard })
+      .catch(async e => {
+        process.stderr.write(`permission_request See more edit failed, retrying as plain text: ${e}\n`)
+        await ctx.editMessageText(full.fullPlainParts[0], { reply_markup: keyboard })
+      })
+      .catch(e => {
+        process.stderr.write(`permission_request See more edit failed: ${e}\n`)
+      })
+    const chatId = ctx.chat?.id
+    if (chatId != null) {
+      for (let i = 1; i < full.fullHtmlParts.length; i++) {
+        await bot.api
+          .sendMessage(chatId, full.fullHtmlParts[i], { parse_mode: 'HTML' })
+          .catch(async e => {
+            process.stderr.write(`permission_request See more part ${i} failed, retrying as plain text: ${e}\n`)
+            await bot.api.sendMessage(chatId, full.fullPlainParts[i])
+          })
+          .catch(e => {
+            process.stderr.write(`permission_request See more part ${i} failed: ${e}\n`)
+          })
+      }
+    }
     await ctx.answerCallbackQuery().catch(() => {})
     return
   }
