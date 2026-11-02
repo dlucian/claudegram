@@ -10,8 +10,9 @@ This fork **is** the source of truth. There is no patch layer any more (the old
 2. **Bump the version** in `.claude-plugin/plugin.json` (e.g. `0.0.8` → `0.0.9`).
    This is the trigger — `claude plugin update` only re-pulls when the version
    changes. Skipping the bump = the deploy silently no-ops.
-3. Typecheck: `bun build server.ts --target node --outfile /tmp/x.js` (no
-   tsconfig, so this bundle IS the parse/type gate; ~255 modules = clean).
+3. Test and typecheck: `bun test`, then
+   `bun build server.ts --target node --outfile /tmp/x.js` (no tsconfig, so
+   this bundle IS the parse/type gate; ~255 modules = clean).
 4. Commit + push to `github.com/dlucian/claudegram` (the marketplace source).
    Use the ezri-helper bot: `GH_TOKEN="$EZRI_GH_TOKEN" git push`.
 5. Pull it into the live cache:
@@ -19,11 +20,16 @@ This fork **is** the source of truth. There is no patch layer any more (the old
    claude plugin marketplace update claudegram      # re-pull github HEAD
    claude plugin update telegram@claudegram          # stage new version in cache
    ```
-6. **Verify** the new cache byte-matches the fork before trusting it:
+6. **Verify** the new cache byte-matches the fork before trusting it.
+   `server.ts` imports `permission-format.ts`, so compare both files: a cache
+   with a stale or missing `permission-format.ts` fails at startup even when
+   `server.ts` matches.
    ```
    V=$(python3 -c "import json;print(json.load(open('.claude-plugin/plugin.json'))['version'])")
-   diff <(git show HEAD:server.ts) \
-     "$HOME/.claude/plugins/cache/claudegram/telegram/$V/server.ts" && echo OK
+   for f in server.ts permission-format.ts; do
+     diff <(git show HEAD:$f) \
+       "$HOME/.claude/plugins/cache/claudegram/telegram/$V/$f" && echo "OK $f"
+   done
    ```
 7. **Restart to apply** — the running `bun` plugin process only loads new code on
    a session restart. Safe path: `ezri-rotate-session` (self-verifying, pings
