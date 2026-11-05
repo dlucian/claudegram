@@ -5,7 +5,9 @@ import {
 import { tmpdir } from 'os'
 import { join } from 'path'
 import {
-  appendEntry, BOOT_GRACE_MS, createQueue, readEntries, removeEntry, type Notification,
+  ACK_TIMEOUT_MS, appendEntry, BOOT_GRACE_MS, createQueue, FAIL_OPEN_SPACING_MS, MAX_ATTEMPTS, MAX_HOLD_MS,
+  QUEUED_REACTION, readEntries, readSessionState, removeEntry, SEND_RETRY_MS, setAttempts, SETTLE_MS, STALE_BUSY_MS,
+  sweepDeadStateFiles, type Notification, type SessionState,
 } from '../notif-queue.ts'
 
 // Every test works in a temporary directory with a stub `send`. Nothing here
@@ -96,6 +98,7 @@ describe('corrupt lines', () => {
     await waitFor(() => sent.length === 1)
     expect(sent).toEqual(['after'])
     expect(readFileSync(corruptPath, 'utf8')).toBe('not json\n')
+    await waitFor(() => !existsSync(path))
     expect(existsSync(path)).toBe(false)
   })
 
@@ -235,6 +238,7 @@ describe('ordering and delivery', () => {
     q.open()
     await waitFor(() => sent.length === 1)
     expect(content(sent[0])).toBe('legacy')
+    await waitFor(() => !existsSync(path))
     expect(existsSync(path)).toBe(false)
   })
 
@@ -249,9 +253,9 @@ describe('ordering and delivery', () => {
     expect(readEntries(path, corruptPath, () => {})).toHaveLength(1)
   })
 
-  test('strips _id and _queuedAt before sending', async () => {
+  test('strips _id, _queuedAt, and _attempts before sending', async () => {
     const { path, corruptPath } = setup()
-    appendEntry(path, note('plain'))
+    setAttempts(path, appendEntry(path, note('plain')), 2)
     const sent: Notification[] = []
     const q = createQueue({ path, corruptPath, log: () => {}, send: async n => { sent.push(n) } })
     q.open()
@@ -280,6 +284,7 @@ describe('ordering and delivery', () => {
     after.open()
     await waitFor(() => sent.length === 1)
     expect(sent).toEqual(['queued before restart'])
+    await waitFor(() => !existsSync(path))
     expect(existsSync(path)).toBe(false)
   })
 
@@ -366,7 +371,8 @@ describe('ordering and delivery', () => {
     const first = q.enqueue(note('A'))
     await waitFor(() => inFlight === 1)
     await q.enqueue(note('B')) // returns at once, because a flush is running
-    await q.flush()
+    void q.flush()
+    await new Promise(r => setTimeout(r, 10))
     expect(inFlight).toBe(1)
     release()
     await first
@@ -479,5 +485,611 @@ describe('server.ts wiring', () => {
     const queued = [...src.matchAll(/notifyOrQueue\(\{\s*method: '([^']+)'/g)]
     expect(queued.length).toBeGreaterThanOrEqual(3)
     for (const m of queued) expect(m[1]).toBe('notifications/claude/channel')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Gated delivery (dlucian/ezri#474). The clock, the session state, and the
+// bot.pid check are all fakes, so each test decides what the session is doing.
+
+function gatedSetup(overrides: Partial<Parameters<typeof createQueue>[0]> = {}) {
+  const paths = setup()
+  const clock = { t: Date.now() }
+  const world = { state: null as SessionState | null, owner: true, disabled: false }
+  const sent: string[] = []
+  const warns: string[] = []
+  const released: string[] = []
+  const logs: string[] = []
+  const q = createQueue({
+    path: paths.path,
+    corruptPath: paths.corruptPath,
+    log: m => logs.push(m),
+    send: async n => { sent.push(content(n)) },
+    readState: () => world.state,
+    isOwner: () => world.owner,
+    disabled: () => world.disabled,
+    warn: async (_e, text) => { warns.push(text) },
+    onRelease: async n => { released.push(content(n)) },
+    now: () => clock.t,
+    ...overrides,
+  })
+  /** Writes the session state as a hook would, stamped with the fake clock plus `ago` milliseconds in the past. */
+  const write = (state: 'busy' | 'idle', ago = 0) => { world.state = { state, mtimeMs: clock.t - ago } }
+  const advance = (ms: number) => { clock.t += ms }
+  /** Opens the queue and lets the first pass on the empty file finish, so the test controls the next one. */
+  const open = async () => { q.open(); await new Promise(r => setTimeout(r, 10)) }
+  return { ...paths, clock, world, sent, warns, released, logs, q, write, advance, open }
+}
+
+describe('hold until idle', () => {
+  test('holds while the state is busy and fresh', async () => {
+    const g = gatedSetup()
+    await g.open()
+    g.write('busy')
+    expect(await g.q.enqueue(note('A'))).toBe('held')
+    for (let i = 0; i < 5; i++) {
+      g.advance(60_000)
+      g.write('busy') // the session keeps working and the hooks keep writing
+      await g.q.pump()
+    }
+    expect(g.sent).toEqual([])
+    expect(queued(g.path, g.corruptPath)).toEqual(['A'])
+  })
+
+  test('sends at once when idle past the settle window', async () => {
+    const g = gatedSetup()
+    await g.open()
+    g.write('idle', SETTLE_MS)
+    expect(await g.q.enqueue(note('A'))).toBe('sent')
+    expect(g.sent).toEqual(['A'])
+  })
+
+  test('holds during the settle window and stays held if busy returns', async () => {
+    const g = gatedSetup()
+    await g.open()
+    g.write('idle', SETTLE_MS - 1)
+    expect(await g.q.enqueue(note('A'))).toBe('held')
+    g.advance(500)
+    g.write('busy') // a background task notification starts a turn inside the window
+    g.advance(SETTLE_MS * 2)
+    await g.q.pump()
+    expect(g.sent).toEqual([])
+    g.write('idle')
+    g.advance(SETTLE_MS)
+    await g.q.pump()
+    expect(g.sent).toEqual(['A'])
+  })
+
+  test('releases exactly one entry per idle transition', async () => {
+    const g = gatedSetup()
+    await g.open()
+    g.write('idle', SETTLE_MS)
+    for (const c of ['A', 'B', 'C']) await g.q.enqueue(note(c))
+    expect(g.sent).toEqual(['A'])
+    // Nothing changes: the session has not reacted yet, so nothing else goes out.
+    g.advance(10_000)
+    g.write('idle', 10_000 + SETTLE_MS) // an older idle write, not later than the send
+    await g.q.pump()
+    expect(g.sent).toEqual(['A'])
+    // Turn for A: busy, then idle.
+    g.advance(1_000)
+    g.write('busy')
+    await g.q.pump()
+    g.advance(20_000)
+    g.write('idle')
+    await g.q.pump()
+    expect(g.sent).toEqual(['A']) // A is removed, and B waits out the settle window
+    expect(queued(g.path, g.corruptPath)).toEqual(['B', 'C'])
+    g.advance(SETTLE_MS)
+    await g.q.pump()
+    expect(g.sent).toEqual(['A', 'B'])
+    await g.q.pump()
+    expect(g.sent).toEqual(['A', 'B'])
+  })
+
+  test('queues a second message sent before the first turn starts', async () => {
+    const g = gatedSetup()
+    await g.open()
+    g.write('idle', SETTLE_MS)
+    expect(await g.q.enqueue(note('A'))).toBe('sent')
+    g.advance(200) // the hook has not run yet, so the state still says idle
+    expect(await g.q.enqueue(note('B'))).toBe('held')
+    expect(g.sent).toEqual(['A'])
+    expect(queued(g.path, g.corruptPath)).toEqual(['A', 'B'])
+  })
+
+  test('keeps FIFO order across holds, releases, and reload', async () => {
+    const g = gatedSetup()
+    await g.open()
+    g.write('busy')
+    for (const c of ['A', 'B']) await g.q.enqueue(note(c))
+    g.q.close()
+    // A new process opens the same file, and the session has gone idle.
+    const again = createQueue({
+      path: g.path, corruptPath: g.corruptPath, log: () => {}, send: async n => { g.sent.push(content(n)) },
+      readState: () => g.world.state, now: () => g.clock.t,
+    })
+    again.open()
+    await again.enqueue(note('C'))
+    g.advance(1_000)
+    g.write('idle', SETTLE_MS)
+    await again.pump()
+    expect(g.sent).toEqual(['A'])
+    for (const expected of ['B', 'C']) {
+      g.advance(1_000)
+      g.write('busy')
+      g.advance(5_000)
+      g.write('idle')
+      await again.pump() // removes the turn that just ended
+      g.advance(SETTLE_MS)
+      await again.pump()
+      expect(g.sent.at(-1)).toBe(expected)
+    }
+    expect(g.sent).toEqual(['A', 'B', 'C'])
+  })
+})
+
+describe('staleness and the hold cap', () => {
+  test('treats busy as stale at STALE_BUSY_MS and fresh 1 ms before', async () => {
+    const g = gatedSetup()
+    await g.open()
+    g.write('busy', STALE_BUSY_MS - 1)
+    await g.q.enqueue(note('A'))
+    expect(g.sent).toEqual([])
+    g.advance(1)
+    await g.q.pump()
+    expect(g.sent).toEqual(['A'])
+  })
+
+  test('drains one entry per spacing interval while stale', async () => {
+    const g = gatedSetup()
+    await g.open()
+    g.write('busy', STALE_BUSY_MS + 1)
+    for (const c of ['A', 'B', 'C']) await g.q.enqueue(note(c))
+    expect(g.sent).toEqual(['A'])
+    g.advance(FAIL_OPEN_SPACING_MS - 1)
+    await g.q.pump()
+    expect(g.sent).toEqual(['A'])
+    g.advance(1)
+    await g.q.pump()
+    expect(g.sent).toEqual(['A', 'B'])
+    g.advance(FAIL_OPEN_SPACING_MS)
+    await g.q.pump()
+    expect(g.sent).toEqual(['A', 'B', 'C'])
+    expect(existsSync(g.path)).toBe(false) // a fail-open send is removed at send
+  })
+
+  test('releases a head older than MAX_HOLD_MS under a fresh marker', async () => {
+    const g = gatedSetup()
+    await g.open()
+    g.write('busy')
+    await g.q.enqueue(note('A'))
+    g.advance(MAX_HOLD_MS - 1000)
+    g.write('busy') // a runaway turn keeps the marker fresh
+    await g.q.pump()
+    expect(g.sent).toEqual([])
+    g.advance(1000)
+    g.write('busy')
+    await g.q.pump()
+    expect(g.sent).toEqual(['A'])
+    expect(existsSync(g.path)).toBe(false)
+  })
+
+  test('counts a head with no queuedAt as past the hold cap', async () => {
+    const g = gatedSetup()
+    writeFileSync(g.path, JSON.stringify({ ...note('old'), _id: 'x1' }) + '\n')
+    await g.open()
+    g.write('busy')
+    await g.q.pump()
+    expect(g.sent).toEqual(['old'])
+  })
+})
+
+describe('missing and foreign state', () => {
+  test('delivers immediately when the state file is missing or unreadable', async () => {
+    const g = gatedSetup()
+    await g.open()
+    g.world.state = null
+    expect(await g.q.enqueue(note('A'))).toBe('sent')
+    expect(g.sent).toEqual(['A'])
+    const dir = mkdtempSync(join(tmpdir(), 'state-read-'))
+    dirs.push(dir)
+    expect(readSessionState(dir, 4242)).toBeNull() // missing
+    mkdirSync(join(dir, 'session-state'))
+    writeFileSync(join(dir, 'session-state', '4242'), 'running\n')
+    expect(readSessionState(dir, 4242)).toBeNull() // not a state word
+    writeFileSync(join(dir, 'session-state', '4242'), '')
+    expect(readSessionState(dir, 4242)).toBeNull()
+    expect(readSessionState(dir, null)).toBeNull() // no claude ancestor
+  })
+
+  test('ignores a busy file that belongs to another PID', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'state-read-'))
+    dirs.push(dir)
+    mkdirSync(join(dir, 'session-state'))
+    writeFileSync(join(dir, 'session-state', '111'), 'busy\n')
+    expect(readSessionState(dir, 111)?.state).toBe('busy')
+    expect(readSessionState(dir, 222)).toBeNull()
+  })
+
+  test("removes dead PIDs' state files and keeps live ones", () => {
+    const dir = mkdtempSync(join(tmpdir(), 'state-sweep-'))
+    dirs.push(dir)
+    const sd = join(dir, 'session-state')
+    mkdirSync(sd)
+    for (const name of ['101', '102']) writeFileSync(join(sd, name), 'idle\n')
+    writeFileSync(join(sd, '.101.55.tmp'), 'busy\n')
+    writeFileSync(join(sd, 'notes.txt'), 'keep')
+    const removed = sweepDeadStateFiles(dir, () => {}, pid => pid === 102, Date.now() + 120_000)
+    expect(removed).toBe(2) // dead 101 and the old temp file
+    expect(existsSync(join(sd, '101'))).toBe(false)
+    expect(existsSync(join(sd, '102'))).toBe(true)
+    expect(existsSync(join(sd, '.101.55.tmp'))).toBe(false)
+    expect(existsSync(join(sd, 'notes.txt'))).toBe(true)
+  })
+})
+
+describe('in flight', () => {
+  test('keeps a sent head until an idle write later than the send', async () => {
+    const g = gatedSetup()
+    await g.open()
+    g.write('idle', SETTLE_MS)
+    await g.q.enqueue(note('A'))
+    const sentAt = g.clock.t
+    expect(queued(g.path, g.corruptPath)).toEqual(['A'])
+    g.world.state = { state: 'idle', mtimeMs: sentAt } // not later than the send
+    g.advance(5_000)
+    await g.q.pump()
+    expect(queued(g.path, g.corruptPath)).toEqual(['A'])
+    g.world.state = { state: 'idle', mtimeMs: sentAt + 1 }
+    await g.q.pump()
+    expect(existsSync(g.path)).toBe(false)
+  })
+
+  test('a send that resolves with no turn following must not lose the entry', async () => {
+    // The harness can drop a notification that arrives before it registers its
+    // channel handler, even though `mcp.notification` resolves.
+    const g = gatedSetup()
+    await g.open()
+    g.write('idle', SETTLE_MS)
+    await g.q.enqueue(note('A'))
+    expect(g.sent).toEqual(['A'])
+    for (let i = 0; i < 20; i++) {
+      g.advance(1_000)
+      await g.q.pump() // the state never changes: no turn started
+    }
+    expect(queued(g.path, g.corruptPath)).toEqual(['A'])
+    expect(g.sent).toEqual(['A']) // still inside the ack window
+    g.advance(ACK_TIMEOUT_MS)
+    await g.q.pump()
+    expect(g.sent).toEqual(['A', 'A']) // the second send reaches a registered handler
+    g.advance(1_000)
+    g.write('busy')
+    g.advance(2_000)
+    g.write('idle')
+    await g.q.pump()
+    expect(existsSync(g.path)).toBe(false)
+  })
+
+  test('resends after ACK_TIMEOUT_MS and warns after MAX_ATTEMPTS', async () => {
+    const g = gatedSetup()
+    await g.open()
+    g.write('idle', SETTLE_MS)
+    await g.q.enqueue(note('B'))
+    await g.q.enqueue(note('after'))
+    for (let i = 1; i < MAX_ATTEMPTS; i++) {
+      g.advance(ACK_TIMEOUT_MS - 1)
+      await g.q.pump()
+      expect(g.sent.length).toBe(i) // not yet
+      g.advance(1)
+      await g.q.pump()
+      expect(g.sent.length).toBe(i + 1)
+    }
+    expect(g.sent).toEqual(Array(MAX_ATTEMPTS).fill('B'))
+    expect(g.warns).toEqual([])
+    g.advance(ACK_TIMEOUT_MS)
+    await g.q.pump()
+    expect(g.warns).toHaveLength(1)
+    expect(g.warns[0]).toContain('entry') // no message_id in this fixture, so it names the entry
+    expect(queued(g.path, g.corruptPath)).toEqual(['after']) // the queue moved on
+    g.advance(SETTLE_MS)
+    await g.q.pump()
+    expect(g.sent.at(-1)).toBe('after')
+  })
+
+  test('names the message ID in the dropped-message warning', async () => {
+    const g = gatedSetup()
+    await g.open()
+    g.write('idle', SETTLE_MS)
+    await g.q.enqueue({ method: 'notifications/claude/channel', params: { content: 'X', meta: { message_id: '777' } } })
+    for (let i = 0; i < MAX_ATTEMPTS; i++) {
+      g.advance(ACK_TIMEOUT_MS)
+      await g.q.pump()
+    }
+    expect(g.warns[0]).toContain('message 777')
+    expect(g.warns[0]).not.toContain('X')
+  })
+
+  test('a failed warning does not block the head', async () => {
+    const g = gatedSetup({ warn: async () => { throw new Error('telegram down') } })
+    await g.open()
+    g.write('idle', SETTLE_MS)
+    await g.q.enqueue(note('A'))
+    for (let i = 0; i < MAX_ATTEMPTS; i++) {
+      g.advance(ACK_TIMEOUT_MS)
+      await g.q.pump()
+    }
+    expect(existsSync(g.path)).toBe(false)
+    expect(g.logs.some(m => m.includes('cannot send the dropped-message warning'))).toBe(true)
+  })
+
+  test('removes a head whose busy marker went stale', async () => {
+    const g = gatedSetup()
+    await g.open()
+    g.write('idle', SETTLE_MS)
+    await g.q.enqueue(note('A'))
+    g.advance(1_000)
+    g.write('busy') // the turn started, and then the hooks went quiet
+    g.advance(STALE_BUSY_MS)
+    await g.q.pump()
+    expect(existsSync(g.path)).toBe(false)
+  })
+
+  test('removes a head that stayed in flight for MAX_HOLD_MS', async () => {
+    const g = gatedSetup()
+    await g.open()
+    g.write('idle', SETTLE_MS)
+    await g.q.enqueue(note('A'))
+    g.advance(MAX_HOLD_MS - 1)
+    g.write('busy')
+    await g.q.pump()
+    expect(queued(g.path, g.corruptPath)).toEqual(['A'])
+    g.advance(1)
+    g.write('busy')
+    await g.q.pump()
+    expect(existsSync(g.path)).toBe(false)
+  })
+
+  test('never resends a fresh message when no state file exists', async () => {
+    const g = gatedSetup()
+    await g.open()
+    g.world.state = null
+    await g.q.enqueue(note('A'))
+    for (let i = 0; i < 5; i++) {
+      g.advance(ACK_TIMEOUT_MS)
+      await g.q.pump()
+    }
+    expect(g.sent).toEqual(['A'])
+    expect(existsSync(g.path)).toBe(false)
+  })
+
+  test('replays a persisted head after restart and keeps its retries', async () => {
+    const g = gatedSetup()
+    // An earlier process queued "A" and sent it once before it died.
+    const key = appendEntry(g.path, note('A'))
+    setAttempts(g.path, key, 1)
+    expect(readEntries(g.path, g.corruptPath, () => {})[0]!.attempts).toBe(1)
+    await g.open() // this process has seen no state file
+    await g.q.pump()
+    expect(g.sent).toEqual(['A'])
+    expect(readEntries(g.path, g.corruptPath, () => {})[0]!.attempts).toBe(2)
+    g.advance(ACK_TIMEOUT_MS)
+    await g.q.pump() // the third and last send
+    expect(g.sent).toEqual(['A', 'A'])
+    g.advance(ACK_TIMEOUT_MS)
+    await g.q.pump()
+    expect(g.warns).toHaveLength(1)
+    expect(existsSync(g.path)).toBe(false)
+  })
+
+  test('drops a persisted entry that already used its attempts without sending it again', async () => {
+    const g = gatedSetup()
+    const key = appendEntry(g.path, note('A'))
+    setAttempts(g.path, key, MAX_ATTEMPTS)
+    await g.open()
+    await g.q.pump()
+    expect(g.sent).toEqual([])
+    expect(g.warns).toHaveLength(1)
+    expect(existsSync(g.path)).toBe(false)
+  })
+
+  test('keeps the head and retries when send rejects, without using an attempt', async () => {
+    let up = false
+    const g = gatedSetup({ send: async () => { if (!up) throw new Error('MCP unreachable') } })
+    await g.open()
+    g.write('idle', SETTLE_MS)
+    await g.q.enqueue(note('A'))
+    for (let i = 0; i < 5; i++) {
+      g.advance(SEND_RETRY_MS)
+      await g.q.pump()
+    }
+    expect(queued(g.path, g.corruptPath)).toEqual(['A'])
+    expect(readEntries(g.path, g.corruptPath, () => {})[0]!.attempts).toBeUndefined()
+    up = true
+    g.advance(SEND_RETRY_MS)
+    await g.q.pump()
+    expect(readEntries(g.path, g.corruptPath, () => {})[0]!.attempts).toBe(1)
+    expect(g.warns).toEqual([])
+  })
+
+  test('a poll tick waits SEND_RETRY_MS after a rejected send', async () => {
+    let calls = 0
+    const g = gatedSetup({ send: async () => { calls++; throw new Error('down') }, pollMs: 5 })
+    await g.open()
+    g.write('idle', SETTLE_MS)
+    await g.q.enqueue(note('A'))
+    expect(calls).toBe(1)
+    await new Promise(r => setTimeout(r, 60)) // a dozen ticks, all inside the retry wait
+    expect(calls).toBe(1)
+    g.advance(SEND_RETRY_MS)
+    await waitFor(() => calls === 2)
+    g.q.close()
+  })
+
+  test('a send that never settles counts as rejected and keeps the head', async () => {
+    const g = gatedSetup({ send: () => new Promise(() => {}), sendTimeoutMs: 20 })
+    await g.open()
+    g.write('idle', SETTLE_MS)
+    expect(await g.q.enqueue(note('A'))).toBe('held') // the loop returned instead of hanging
+    expect(queued(g.path, g.corruptPath)).toEqual(['A'])
+    expect(g.logs.some(m => m.includes('timed out'))).toBe(true)
+    expect(readEntries(g.path, g.corruptPath, () => {})[0]!.attempts).toBeUndefined()
+  })
+
+  test('after a failed removal, the delivered head is removed again and never resent', async () => {
+    const g = gatedSetup()
+    await g.open()
+    g.write('idle', SETTLE_MS)
+    await g.q.enqueue(note('A'))
+    await g.q.enqueue(note('B'))
+    g.advance(1_000)
+    g.write('busy')
+    g.advance(1_000)
+    g.write('idle')
+    mkdirSync(`${g.path}.tmp-${process.pid}`) // a directory makes the rewrite fail
+    await g.q.pump()
+    expect(queued(g.path, g.corruptPath)).toEqual(['A', 'B'])
+    g.advance(60_000)
+    await g.q.pump()
+    expect(g.sent).toEqual(['A']) // A is not sent again, and B waits behind it
+    rmSync(`${g.path}.tmp-${process.pid}`, { recursive: true })
+    await g.q.pump()
+    expect(g.sent).toEqual(['A', 'B']) // A went out once; B follows after its removal
+    expect(queued(g.path, g.corruptPath)).toEqual(['B'])
+  })
+})
+
+describe('what is queued and who delivers', () => {
+  test('holds a reaction in order with today\'s content and meta', async () => {
+    const g = gatedSetup()
+    const received: Notification[] = []
+    const q = createQueue({
+      path: g.path, corruptPath: g.corruptPath, log: () => {}, send: async n => { received.push(n) },
+      readState: () => g.world.state, now: () => g.clock.t,
+    })
+    q.open()
+    g.write('busy')
+    const reaction: Notification = {
+      method: 'notifications/claude/channel',
+      params: {
+        content: 'Reacted with 👍 to message_id 9',
+        meta: { chat_id: '1', message_id: '9', kind: 'reaction', reaction_added: '👍', user: 'u', user_id: '2', ts: 't' },
+      },
+    }
+    await q.enqueue(note('before'))
+    await q.enqueue(reaction)
+    await q.enqueue(note('after'))
+    g.write('idle', SETTLE_MS)
+    await q.pump()
+    expect(received).toEqual([note('before')])
+    for (let i = 0; i < 2; i++) {
+      g.advance(1_000); g.write('busy'); g.advance(1_000); g.write('idle')
+      await q.pump()
+      g.advance(SETTLE_MS)
+      await q.pump()
+    }
+    expect(received).toEqual([note('before'), reaction, note('after')])
+  })
+
+  test('QUEUED_REACTION is on the Telegram allowlist', () => {
+    const types = readFileSync(
+      join(import.meta.dir, '..', 'node_modules', '@grammyjs', 'types', 'message.d.ts'), 'utf8',
+    )
+    const union = types.split('\n').find(l => l.includes('emoji: "👍"'))
+    expect(union).toBeDefined()
+    expect(union!).toContain(`"${QUEUED_REACTION}"`)
+    expect(QUEUED_REACTION).toBe('🫡')
+  })
+
+  test('does not deliver when bot.pid names another process', async () => {
+    const g = gatedSetup()
+    await g.open()
+    g.world.owner = false
+    g.write('idle', SETTLE_MS)
+    expect(await g.q.enqueue(note('A'))).toBe('held')
+    await g.q.pump()
+    expect(g.sent).toEqual([])
+    expect(queued(g.path, g.corruptPath)).toEqual(['A']) // appended, never lost
+    g.world.owner = true
+    await g.q.pump()
+    expect(g.sent).toEqual(['A'])
+  })
+
+  test('delivers a line another process appended while the local queue was empty', async () => {
+    const g = gatedSetup({ pollMs: 5 })
+    await g.open()
+    g.write('idle', SETTLE_MS)
+    await new Promise(r => setTimeout(r, 20))
+    appendEntry(g.path, note('from another process'))
+    await waitFor(() => g.sent.length === 1)
+    expect(g.sent).toEqual(['from another process'])
+    g.q.close()
+  })
+
+  test('delivers without gating while queue-disabled exists', async () => {
+    const g = gatedSetup()
+    await g.open()
+    g.world.disabled = true
+    g.write('busy')
+    appendEntry(g.path, note('A'))
+    appendEntry(g.path, note('B'))
+    expect(await g.q.enqueue(note('C'))).toBe('sent')
+    expect(g.sent).toEqual(['A', 'B', 'C'])
+    expect(existsSync(g.path)).toBe(false)
+  })
+
+  test('turning the kill switch on releases a head that awaits its turn', async () => {
+    const g = gatedSetup()
+    await g.open()
+    g.write('idle', SETTLE_MS)
+    await g.q.enqueue(note('A'))
+    await g.q.enqueue(note('B'))
+    g.world.disabled = true
+    await g.q.pump()
+    expect(g.sent).toEqual(['A', 'B'])
+    expect(existsSync(g.path)).toBe(false)
+  })
+
+  test('runs the release hook before each send, and a failing hook does not block it', async () => {
+    const order: string[] = []
+    const g = gatedSetup({
+      onRelease: async () => { order.push('release'); throw new Error('reaction failed') },
+      send: async () => { order.push('send') },
+    })
+    await g.open()
+    g.write('idle', SETTLE_MS)
+    await g.q.enqueue(note('A'))
+    expect(order).toEqual(['release', 'send'])
+  })
+
+  test('close stops delivery and the poll timer', async () => {
+    const g = gatedSetup({ pollMs: 5 })
+    await g.open()
+    g.q.close()
+    g.write('idle', SETTLE_MS)
+    appendEntry(g.path, note('late'))
+    await new Promise(r => setTimeout(r, 40))
+    await g.q.pump()
+    expect(g.sent).toEqual([])
+    expect(queued(g.path, g.corruptPath)).toEqual(['late'])
+  })
+
+  test('stats reports the depth and whether the head awaits its turn', async () => {
+    const g = gatedSetup()
+    await g.open()
+    g.write('idle', SETTLE_MS)
+    await g.q.enqueue(note('A'))
+    await g.q.enqueue(note('B'))
+    expect(g.q.stats()).toEqual({ depth: 2, inFlight: true })
+  })
+
+  test('permission notifications never pass through enqueue', () => {
+    const source = readFileSync(join(import.meta.dir, '..', 'server.ts'), 'utf8')
+    const permission = [...source.matchAll(/mcp\.notification\(\{\s*method: 'notifications\/claude\/channel\/permission'/g)]
+    expect(permission.length).toBeGreaterThanOrEqual(2) // the button and the "yes xxxxx" reply
+    expect(source).not.toMatch(/notifyOrQueue\(\{\s*method: 'notifications\/claude\/channel\/permission/)
+    expect(source).not.toMatch(/queue\.enqueue\(\{\s*method: 'notifications\/claude\/channel\/permission/)
+    // The queue is only entered through notifyOrQueue.
+    expect([...source.matchAll(/queue\.enqueue\(/g)].length).toBe(1)
   })
 })
