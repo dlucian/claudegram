@@ -24,6 +24,7 @@ import { homedir } from 'os'
 import { join, extname, sep } from 'path'
 import { execSync, spawn } from 'child_process'
 import { formatPermissionPrompt } from './permission-format.ts'
+import { isPluginWrapper } from './stale-poller.ts'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -233,7 +234,6 @@ const PID_FILE = join(STATE_DIR, 'bot.pid')
 // table at startup and kill every matching server.ts + wrapper before we
 // start polling.
 mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
-const PLUGIN_PATH_HINT = '/.claude/plugins/cache/claude-plugins-official/telegram/'
 try {
   const out = execSync('ps -A -o pid=,ppid=,command=', { encoding: 'utf8' })
   const procs = out.split('\n')
@@ -244,8 +244,7 @@ try {
     .filter((p): p is { pid: number, ppid: number, cmd: string } => p !== null)
   // Wrappers: `bun run --cwd .../telegram/X.Y.Z ... start`. Skip our own.
   const wrappers = procs.filter(p =>
-    p.cmd.includes('bun run') &&
-    p.cmd.includes(PLUGIN_PATH_HINT) &&
+    isPluginWrapper(p.cmd) &&
     p.pid !== process.pid &&
     p.pid !== process.ppid,
   )

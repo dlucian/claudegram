@@ -21,12 +21,12 @@ This fork **is** the source of truth. There is no patch layer any more (the old
    claude plugin update telegram@claudegram          # stage new version in cache
    ```
 6. **Verify** the new cache byte-matches the fork before trusting it.
-   `server.ts` imports `permission-format.ts`, so compare both files: a cache
-   with a stale or missing `permission-format.ts` fails at startup even when
-   `server.ts` matches.
+   `server.ts` imports `permission-format.ts` and `stale-poller.ts`, so compare
+   all three files: a cache with a stale or missing import fails at startup
+   even when `server.ts` matches.
    ```
    V=$(python3 -c "import json;print(json.load(open('.claude-plugin/plugin.json'))['version'])")
-   for f in server.ts permission-format.ts; do
+   for f in server.ts permission-format.ts stale-poller.ts; do
      diff <(git show HEAD:$f) \
        "$HOME/.claude/plugins/cache/claudegram/telegram/$V/$f" && echo "OK $f"
    done
