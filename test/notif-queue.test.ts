@@ -698,9 +698,8 @@ describe('staleness and the hold cap', () => {
   test('counts a head with no queuedAt as past the hold cap', async () => {
     const g = gatedSetup()
     writeFileSync(g.path, JSON.stringify({ ...note('old'), _id: 'x1' }) + '\n')
-    await g.open()
     g.write('busy')
-    await g.q.pump()
+    await g.open()
     expect(g.sent).toEqual(['old'])
   })
 })
