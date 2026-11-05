@@ -336,14 +336,22 @@ export function removeEntry(path: string, key: string, log: Log = () => {}): voi
  * and counts, never a line, because a line can hold a private message.
  */
 export function readEntries(path: string, corruptPath: string, log: Log): QueueEntry[] {
+  return loadEntries(path, corruptPath, log) ?? []
+}
+
+/**
+ * Like `readEntries`, but returns null when the file exists and can't be read.
+ * A missing or empty file is a positively empty queue; a read failure says
+ * nothing about the queue, so the caller must not act on it as if it were empty.
+ */
+function loadEntries(path: string, corruptPath: string, log: Log): QueueEntry[] | null {
   let raw: string
   try {
     raw = readFileSync(path, 'utf8')
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-      log(`cannot read ${basename(path)}: ${(err as NodeJS.ErrnoException).code ?? 'error'}`)
-    }
-    return []
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return []
+    log(`cannot read ${basename(path)}: ${(err as NodeJS.ErrnoException).code ?? 'error'}`)
+    return null
   }
   const entries: QueueEntry[] = []
   let moved = 0
@@ -435,13 +443,14 @@ export type QueueOptions = {
   /** Tells the user an entry was dropped after `MAX_ATTEMPTS` sends. A rejection is logged and never blocks the queue. */
   warn?: (entry: QueueEntry, text: string) => Promise<unknown>
   /**
-   * Runs before each send, for example to clear the queued reaction. `fresh` is true when the entry was appended by
-   * the `enqueue` call that is releasing it, so it never waited and has no queued marker. A rejection is logged and
-   * never blocks the queue.
+   * Runs after a send resolves, for example to clear the queued reaction. A rejected send never runs it, so the
+   * marker stays while the entry stays queued. A send that timed out and resolves late runs it then. `fresh` is
+   * true when the entry was appended by the `enqueue` call that is releasing it, so it never waited and has no
+   * queued marker. A rejection is logged and never blocks the queue.
    */
   onRelease?: (notification: Notification, info: { fresh: boolean }) => Promise<unknown>
   now?: () => number
-  /** How long a send may take before it counts as rejected. Defaults to `SEND_TIMEOUT_MS`. */
+  /** How long a send may take before the entry counts as in flight, uncertain. Defaults to `SEND_TIMEOUT_MS`. */
   sendTimeoutMs?: number
   /** Poll interval. Zero, the default, runs no timer. */
   pollMs?: number
@@ -449,10 +458,25 @@ export type QueueOptions = {
 
 type Flight = { key: string; sentAt: number; attempts: number }
 
+/** A send that timed out. Its promise can still settle, so the entry's delivery is uncertain. */
+type TimedOut = { key: string; at: number; state: 'pending' | 'ok' | 'failed' }
+
+type SendResult =
+  | { kind: 'sent'; sentAt: number }
+  | { kind: 'uncertain'; sentAt: number } // timed out; the original send may still deliver
+  | { kind: 'failed' } // rejected; the head stays and the tick retries after a wait
+  | { kind: 'held' } // the recheck found the session busy; nothing was sent
+
+class SendTimeout extends Error {
+  constructor(readonly what: string, readonly ms: number) {
+    super(`${what} timed out after ${ms} ms`)
+  }
+}
+
 function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout>
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`${what} timed out after ${ms} ms`)), ms)
+    timer = setTimeout(() => reject(new SendTimeout(what, ms)), ms)
   })
   return Promise.race([p, timeout]).finally(() => clearTimeout(timer))
 }
@@ -476,6 +500,8 @@ export function createQueue(opts: QueueOptions): Queue {
   /** A delivered head whose removal failed. It is never sent again. */
   let removeOnly: string | null = null
   let lastFailOpenAt = -Infinity
+  /** The latest send that timed out, until it settles and its outcome is used. */
+  let timedOut: TimedOut | null = null
   let blockedUntil = 0
   /** The key that the running `enqueue` call appended, while that call runs the loop itself. */
   let appendedKey: string | null = null
@@ -496,46 +522,88 @@ export function createQueue(opts: QueueOptions): Queue {
   }
 
   /**
-   * Sends the head once and returns the time just before the send, or null, with the head kept, when the send
-   * rejects or times out. `persist` records the send count in the queue line, for an entry that stays queued.
+   * Sends the head once. `persist` records the send count in the queue line, for an entry that stays queued.
    *
    * `stillOk` re-reads the marker as the last step before the send. When it returns false, a terminal prompt or
-   * another turn started since the decision, so the entry stays queued and the result is `'held'`. The release
-   * hook runs after the check, so a held entry keeps its queued reaction. A turn that starts between this check
-   * and the send can still absorb the message; the window is a few microtasks, and no check closes it.
+   * another turn started since the decision, so the entry stays queued and nothing is sent. A turn that starts
+   * between this check and the send can still absorb the message; the window is a few microtasks, and no check
+   * closes it.
+   *
+   * The release hook (which clears the queued reaction) runs only after the send resolves, so a rejected or
+   * timed-out send leaves the reaction on. A timed-out send is uncertain, not failed: the original promise can
+   * still deliver, so the result is `uncertain` and the caller keeps the entry in flight. When that promise
+   * resolves late, the release hook runs then.
    */
   async function sendHead(
     head: QueueEntry,
     attempts: number,
     persist: boolean,
     stillOk?: () => boolean,
-  ): Promise<number | null | 'held'> {
-    if (stillOk && !stillOk()) return 'held'
-    if (opts.onRelease) {
-      try {
-        await withTimeout(opts.onRelease(head.notification, { fresh: head.key === appendedKey }), 3_000, 'release hook')
-      } catch (err) {
-        log(`release hook failed, sending anyway: ${err}`)
-      }
-    }
+  ): Promise<SendResult> {
+    if (stillOk && !stillOk()) return { kind: 'held' }
+    const fresh = head.key === appendedKey
     // Taken before the send: a hook can write the state while the send awaits.
     const sentAt = now()
+    let sending: Promise<unknown>
     try {
-      await withTimeout(send(head.notification), opts.sendTimeoutMs ?? SEND_TIMEOUT_MS, 'send')
+      sending = Promise.resolve(send(head.notification))
     } catch (err) {
-      blockedUntil = now() + SEND_RETRY_MS
-      log(`MCP unreachable, kept queued notification (${err})`)
-      return null
+      sending = Promise.reject(err)
     }
-    remember(sentKeys, head.key)
-    if (persist) {
-      try {
-        setAttempts(path, head.key, attempts, log)
-      } catch (err) {
-        log(`cannot record the send count: ${err}`)
+    const record = (): void => {
+      remember(sentKeys, head.key)
+      if (persist) {
+        try {
+          setAttempts(path, head.key, attempts, log)
+        } catch (err) {
+          log(`cannot record the send count: ${err}`)
+        }
       }
     }
-    return sentAt
+    try {
+      await withTimeout(sending, opts.sendTimeoutMs ?? SEND_TIMEOUT_MS, 'send')
+    } catch (err) {
+      if (!(err instanceof SendTimeout)) {
+        blockedUntil = now() + SEND_RETRY_MS
+        log(`MCP unreachable, kept queued notification (${err})`)
+        return { kind: 'failed' }
+      }
+      log(`send still pending after ${err.ms} ms, treating the entry as in flight (${head.key.slice(0, 8)})`)
+      const mine: TimedOut = { key: head.key, at: now(), state: 'pending' }
+      timedOut = mine
+      sending.then(
+        () => {
+          mine.state = 'ok'
+          record() // late delivery: count it, and release the entry's marker
+          void releaseHook(head, fresh)
+        },
+        late => {
+          mine.state = 'failed'
+          log(`the send that timed out then failed (${late})`)
+        },
+      )
+      // The attempt counts now, so a restart can't lose track of a send that may deliver.
+      if (persist) {
+        try {
+          setAttempts(path, head.key, attempts, log)
+        } catch (e) {
+          log(`cannot record the send count: ${e}`)
+        }
+      }
+      return { kind: 'uncertain', sentAt }
+    }
+    record()
+    await releaseHook(head, fresh)
+    return { kind: 'sent', sentAt }
+  }
+
+  async function releaseHook(head: QueueEntry, fresh: boolean): Promise<void> {
+    if (!opts.onRelease) return
+    try {
+      await withTimeout(opts.onRelease(head.notification, { fresh }), 3_000, 'release hook')
+    } catch (err) {
+      log(`release hook failed: ${err}`)
+    }
   }
 
   async function giveUp(head: QueueEntry): Promise<boolean> {
@@ -565,10 +633,29 @@ export function createQueue(opts: QueueOptions): Queue {
     if (flight?.key === head.key) {
       // The kill switch came on while the head awaited its turn: its delivery is done.
       flight = null
-      return removeHead(head)
+      return removeAfterDelivery(head)
     }
-    if ((await sendHead(head, (head.attempts ?? 0) + 1, false)) === null) return false
-    return removeHead(head)
+    if (timedOut?.key === head.key) {
+      const t = timedOut
+      // An earlier send timed out. If it has since delivered, the entry is done. If it is still pending, wait for it
+      // until the retry rule expires it, so two sends of one entry never overlap.
+      if (t.state === 'ok') {
+        timedOut = null
+        return removeAfterDelivery(head)
+      }
+      if (t.state === 'pending' && now() - t.at < ACK_TIMEOUT_MS) return false
+      timedOut = null
+    }
+    const result = await sendHead(head, (head.attempts ?? 0) + 1, false)
+    if (result.kind === 'failed' || result.kind === 'held' || result.kind === 'uncertain') return false
+    return removeAfterDelivery(head)
+  }
+
+  /** Removes a delivered head. A failed removal is retried alone, so the entry is never sent a second time. */
+  function removeAfterDelivery(head: QueueEntry): boolean {
+    if (removeHead(head)) return true
+    removeOnly = head.key
+    return false
   }
 
   function readStateSafe(): SessionState | null {
@@ -588,11 +675,6 @@ export function createQueue(opts: QueueOptions): Queue {
   async function passGated(head: QueueEntry, state: SessionState | null): Promise<boolean> {
     const t = now()
 
-    if (removeOnly === head.key) {
-      if (!removeHead(head)) return false
-      removeOnly = null
-      return true
-    }
     if (flight && flight.key !== head.key) flight = null
 
     if (flight) {
@@ -602,19 +684,19 @@ export function createQueue(opts: QueueOptions): Queue {
       const held = t - f.sentAt >= MAX_HOLD_MS
       if (ended || stale || held) {
         flight = null
-        if (removeHead(head)) return true
-        removeOnly = head.key
-        return false
+        return removeAfterDelivery(head)
       }
       const acked = state !== null && state.mtimeMs > f.sentAt
       if (acked || t - f.sentAt < ACK_TIMEOUT_MS) return false
       // The session wrote nothing since the send: the notification probably never became a turn.
       if (f.attempts >= MAX_ATTEMPTS) return giveUp(head)
-      const sentAt = await sendHead(head, f.attempts + 1, true, () => {
+      const result = await sendHead(head, f.attempts + 1, true, () => {
         const latest = readStateSafe()
         return !(latest !== null && latest.mtimeMs > f.sentAt) // a state write since the send is an acknowledgement
       })
-      if (sentAt !== null && sentAt !== 'held') flight = { key: head.key, sentAt, attempts: f.attempts + 1 }
+      if (result.kind === 'sent' || result.kind === 'uncertain') {
+        flight = { key: head.key, sentAt: result.sentAt, attempts: f.attempts + 1 }
+      }
       return false
     }
 
@@ -627,33 +709,45 @@ export function createQueue(opts: QueueOptions): Queue {
     // An entry that an earlier process persisted proves the hooks ran there; a fresh one needs a state file here.
     const track = release === 'now' && (state !== null || sawState || !ownKeys.has(head.key))
     const attempts = (head.attempts ?? 0) + 1
-    const sentAt = await sendHead(head, attempts, track, () => decideRelease(head, readStateSafe(), now()) !== 'hold')
-    if (sentAt === null || sentAt === 'held') return false
+    const result = await sendHead(head, attempts, track, () => decideRelease(head, readStateSafe(), now()) !== 'hold')
+    if (result.kind === 'failed' || result.kind === 'held') return false
     if (release === 'fail-open') lastFailOpenAt = t
-    if (track) {
-      flight = { key: head.key, sentAt, attempts }
+    // A send that timed out is in flight even without proof that the hooks run: it may deliver, so the entry stays
+    // and the no-turn resend path, bounded by MAX_ATTEMPTS, decides what happens next.
+    if (track || result.kind === 'uncertain') {
+      flight = { key: head.key, sentAt: result.sentAt, attempts }
       return false
     }
-    if (removeHead(head)) return true
-    removeOnly = head.key
-    return false
+    return removeAfterDelivery(head)
   }
 
   async function pass(tick: boolean): Promise<void> {
     for (;;) {
       if (closed) return
       if (opts.isOwner && !opts.isOwner()) return
-      let head: QueueEntry | undefined
+      let entries: QueueEntry[] | null
       try {
-        head = readEntries(path, corruptPath, log)[0]
+        entries = loadEntries(path, corruptPath, log)
       } catch (err) {
         log(`cannot read the notification queue: ${err}`)
         return
       }
+      // A read failure says nothing about the queue. Keep the in-flight and pending-removal state, so a recovered
+      // read finds the delivered head still accounted for and doesn't send it again.
+      if (entries === null) return
+      const head = entries[0]
       if (!head) {
         flight = null
         removeOnly = null
+        timedOut = null
         return
+      }
+      if (removeOnly !== null && removeOnly !== head.key) removeOnly = null
+      // A delivered head whose removal failed is removed again, before any send, whether or not delivery is gated.
+      if (removeOnly === head.key) {
+        if (!removeHead(head)) return
+        removeOnly = null
+        continue
       }
       if (tick && now() < blockedUntil) return
       const ungated = !opts.readState || opts.disabled?.() === true

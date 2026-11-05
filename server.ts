@@ -2155,7 +2155,8 @@ const queue = createQueue({
     releasedMessages.add(`${chat_id}:${msgId}`)
     if (releasedMessages.size > 512) releasedMessages.delete(releasedMessages.values().next().value as string)
     if (fresh) return // never waited, so it carries no 🫡
-    // Do not wait for Telegram: a slow API call must not delay the release.
+    // The queue calls this after the send resolved, so a failed send keeps the 🫡.
+    // Do not wait for Telegram: a slow API call must not delay the queue.
     void clearQueuedReaction(chat_id, msgId).catch(err => log(`cannot clear the queued reaction (${err})`))
   },
 })

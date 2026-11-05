@@ -328,7 +328,7 @@ describe('ordering and delivery', () => {
     expect(existsSync(path)).toBe(false)
   })
 
-  test('stops the flush when removal fails and resends on the next flush', async () => {
+  test('stops the flush when removal fails and retries only the removal on the next flush', async () => {
     const { path, corruptPath } = setup()
     appendEntry(path, note('A'))
     appendEntry(path, note('B'))
@@ -345,8 +345,8 @@ describe('ordering and delivery', () => {
     expect(logs.some(m => m.includes('sent again'))).toBe(true)
     rmSync(tmp, { recursive: true })
     await q.flush()
-    // "A" is a duplicate, the approved cost of never losing a message.
-    expect(sent).toEqual(['A', 'A', 'B'])
+    // "A" was delivered, so only its removal is retried and it is never sent twice.
+    expect(sent).toEqual(['A', 'B'])
     expect(existsSync(path)).toBe(false)
   })
 
@@ -947,14 +947,111 @@ describe('in flight', () => {
     g.q.close()
   })
 
-  test('a send that never settles counts as rejected and keeps the head', async () => {
+  test('a send that never settles is an uncertain send: the entry stays in flight and nothing overlaps it', async () => {
     const g = gatedSetup({ send: () => new Promise(() => {}), sendTimeoutMs: 20 })
     await g.open()
     g.write('idle', SETTLE_MS)
     expect(await g.q.enqueue(note('A'))).toBe('held') // the loop returned instead of hanging
+    expect(g.q.stats()).toEqual({ depth: 1, inFlight: true })
+    expect(g.logs.some(m => m.includes('treating the entry as in flight'))).toBe(true)
+    expect(readEntries(g.path, g.corruptPath, () => {})[0]!.attempts).toBe(1) // the attempt counts
+    expect(g.released).toEqual([]) // an unconfirmed send doesn't clear the queued reaction
+    // Inside the ack window no second send starts, however many polls pass.
+    for (let i = 0; i < 5; i++) {
+      g.advance(ACK_TIMEOUT_MS / 10)
+      await g.q.pump()
+    }
     expect(queued(g.path, g.corruptPath)).toEqual(['A'])
-    expect(g.logs.some(m => m.includes('timed out'))).toBe(true)
-    expect(readEntries(g.path, g.corruptPath, () => {})[0]!.attempts).toBeUndefined()
+  })
+
+  test('a timed-out send without a state file stays in flight instead of being removed at send', async () => {
+    const g = gatedSetup({ send: () => new Promise(() => {}), sendTimeoutMs: 20 })
+    await g.open()
+    g.world.state = null // no proof that the hooks run, so a resolved send would be removed at send
+    expect(await g.q.enqueue(note('A'))).toBe('held')
+    expect(g.q.stats()).toEqual({ depth: 1, inFlight: true })
+    expect(queued(g.path, g.corruptPath)).toEqual(['A'])
+  })
+
+  test('a send that times out and then delivers is acknowledged by the later turn, not sent again', async () => {
+    let finish: () => void = () => {}
+    const sends: string[] = []
+    const g = gatedSetup({
+      send: n => new Promise<void>(r => { sends.push(content(n)); finish = r }),
+      sendTimeoutMs: 20,
+    })
+    await g.open()
+    g.write('idle', SETTLE_MS)
+    await g.q.enqueue(note('A'))
+    expect(g.released).toEqual([])
+    finish() // the original send resolves late
+    await new Promise(r => setTimeout(r, 10))
+    expect(g.released).toEqual(['A']) // the marker clears once the message is known to be delivered
+    g.advance(1_000)
+    g.write('busy')
+    g.advance(1_000)
+    g.write('idle')
+    await g.q.pump()
+    expect(sends).toEqual(['A'])
+    expect(existsSync(g.path)).toBe(false)
+  })
+
+  test('a timed-out send is resent only after the no-turn rule expires it, up to MAX_ATTEMPTS', async () => {
+    const sends: string[] = []
+    const g = gatedSetup({ send: n => { sends.push(content(n)); return new Promise(() => {}) }, sendTimeoutMs: 10 })
+    await g.open()
+    g.write('idle', SETTLE_MS)
+    await g.q.enqueue(note('A'))
+    for (let i = 1; i < MAX_ATTEMPTS; i++) {
+      g.advance(ACK_TIMEOUT_MS - 1)
+      await g.q.pump()
+      expect(sends).toHaveLength(i)
+      g.advance(1)
+      await g.q.pump()
+      expect(sends).toHaveLength(i + 1)
+    }
+    g.advance(ACK_TIMEOUT_MS)
+    await g.q.pump()
+    expect(g.warns).toHaveLength(1)
+    expect(existsSync(g.path)).toBe(false)
+  })
+
+  test('without a gate, a send that is still pending is not sent again until the retry rule expires it', async () => {
+    const sends: string[] = []
+    const paths = setup()
+    let t = Date.now()
+    const q = createQueue({
+      ...paths, log: () => {}, now: () => t, sendTimeoutMs: 10,
+      send: n => { sends.push(content(n)); return new Promise(() => {}) },
+    })
+    q.open()
+    await new Promise(r => setTimeout(r, 10))
+    await q.enqueue(note('A'))
+    expect(sends).toHaveLength(1)
+    t += SEND_RETRY_MS * 2
+    await q.pump()
+    expect(sends).toHaveLength(1) // the first promise is still pending
+    t += ACK_TIMEOUT_MS
+    await q.pump()
+    expect(sends).toHaveLength(2) // the retry rule expired it
+  })
+
+  test('without a gate, a send that times out and then delivers is removed, not sent again', async () => {
+    const sends: string[] = []
+    const paths = setup()
+    let finish: () => void = () => {}
+    const q = createQueue({
+      ...paths, log: () => {}, sendTimeoutMs: 10,
+      send: n => new Promise<void>(r => { sends.push(content(n)); finish = r }),
+    })
+    q.open()
+    await new Promise(r => setTimeout(r, 10))
+    await q.enqueue(note('A'))
+    finish()
+    await new Promise(r => setTimeout(r, 10))
+    await q.pump()
+    expect(sends).toEqual(['A'])
+    expect(existsSync(paths.path)).toBe(false)
   })
 
   test('after a failed removal, the delivered head is removed again and never resent', async () => {
@@ -1071,7 +1168,7 @@ describe('what is queued and who delivers', () => {
     expect(existsSync(g.path)).toBe(false)
   })
 
-  test('runs the release hook before each send, and a failing hook does not block it', async () => {
+  test('runs the release hook after the send resolves, and a failing hook does not undo the send', async () => {
     const order: string[] = []
     const g = gatedSetup({
       onRelease: async () => { order.push('release'); throw new Error('reaction failed') },
@@ -1079,8 +1176,27 @@ describe('what is queued and who delivers', () => {
     })
     await g.open()
     g.write('idle', SETTLE_MS)
-    await g.q.enqueue(note('A'))
-    expect(order).toEqual(['release', 'send'])
+    expect(await g.q.enqueue(note('A'))).toBe('sent')
+    expect(order).toEqual(['send', 'release'])
+    expect(g.q.stats().inFlight).toBe(true)
+  })
+
+  test('a rejected send leaves the queued reaction on', async () => {
+    let up = false
+    const g = gatedSetup({ send: async () => { if (!up) throw new Error('MCP unreachable'); } })
+    await g.open()
+    g.write('busy')
+    expect(await g.q.enqueue(note('A'))).toBe('held') // 🫡 goes on
+    g.write('idle', SETTLE_MS)
+    for (let i = 0; i < 3; i++) {
+      g.advance(SEND_RETRY_MS)
+      await g.q.pump()
+    }
+    expect(g.released).toEqual([]) // the release hook, which clears 🫡, never ran
+    up = true
+    g.advance(SEND_RETRY_MS)
+    await g.q.pump()
+    expect(g.released).toEqual(['A'])
   })
 
   test('tells the release hook whether the entry waited', async () => {
@@ -1328,5 +1444,106 @@ describe('server.ts shutdown', () => {
     expect([...body.matchAll(/rmSync\(([^)]*)\)/g)].map(m => m[1])).toEqual(['PID_FILE'])
     // The sweep of dead processes' markers is the only removal.
     expect(src).toMatch(/sweepDeadStateFiles\(STATE_DIR, log\)/)
+  })
+})
+
+describe('kill switch and read errors', () => {
+  test('queue-disabled retries only the removal after a failed removal, over several polls', async () => {
+    const g = gatedSetup()
+    await g.open()
+    g.world.disabled = true
+    appendEntry(g.path, note('A'))
+    appendEntry(g.path, note('B'))
+    mkdirSync(`${g.path}.tmp-${process.pid}`) // removal now fails
+    await g.q.pump()
+    for (let i = 0; i < 5; i++) {
+      g.advance(1_000)
+      await g.q.pump()
+    }
+    expect(g.sent).toEqual(['A']) // not once per poll
+    rmSync(`${g.path}.tmp-${process.pid}`, { recursive: true })
+    await g.q.pump()
+    expect(g.sent).toEqual(['A', 'B'])
+    expect(existsSync(g.path)).toBe(false)
+  })
+
+  test('a removal failure that began in gated mode still retries only the removal when the kill switch comes on', async () => {
+    const g = gatedSetup()
+    await g.open()
+    g.write('idle', SETTLE_MS)
+    await g.q.enqueue(note('A'))
+    await g.q.enqueue(note('B'))
+    g.advance(1_000); g.write('busy'); g.advance(1_000); g.write('idle')
+    mkdirSync(`${g.path}.tmp-${process.pid}`)
+    await g.q.pump() // the turn ended, removal fails
+    g.world.disabled = true
+    for (let i = 0; i < 3; i++) {
+      g.advance(1_000)
+      await g.q.pump()
+    }
+    expect(g.sent).toEqual(['A'])
+    rmSync(`${g.path}.tmp-${process.pid}`, { recursive: true })
+    await g.q.pump()
+    expect(g.sent).toEqual(['A', 'B'])
+  })
+
+  test('a read failure keeps the in-flight state and sends nothing again', async () => {
+    const g = gatedSetup()
+    await g.open()
+    g.write('idle', SETTLE_MS)
+    await g.q.enqueue(note('A'))
+    const moved = `${g.path}.moved`
+    renameSync(g.path, moved)
+    mkdirSync(g.path) // reading a directory fails with EISDIR, which is not "missing"
+    for (let i = 0; i < 4; i++) {
+      g.advance(1_000)
+      await g.q.pump()
+    }
+    expect(g.logs.some(m => m.includes('cannot read'))).toBe(true)
+    rmSync(g.path, { recursive: true })
+    renameSync(moved, g.path)
+    g.advance(1_000)
+    await g.q.pump()
+    expect(g.sent).toEqual(['A']) // still accounted for: no resend inside the ack window
+    g.advance(1_000); g.write('busy'); g.advance(1_000); g.write('idle')
+    await g.q.pump()
+    expect(existsSync(g.path)).toBe(false) // the turn's end still removes it
+  })
+
+  test('a read failure keeps the pending removal', async () => {
+    const g = gatedSetup()
+    await g.open()
+    g.write('idle', SETTLE_MS)
+    await g.q.enqueue(note('A'))
+    await g.q.enqueue(note('B'))
+    g.advance(1_000); g.write('busy'); g.advance(1_000); g.write('idle')
+    mkdirSync(`${g.path}.tmp-${process.pid}`)
+    await g.q.pump() // removal of A fails, so it is pending
+    rmSync(`${g.path}.tmp-${process.pid}`, { recursive: true })
+    const moved = `${g.path}.moved`
+    renameSync(g.path, moved)
+    mkdirSync(g.path)
+    g.advance(60_000)
+    await g.q.pump()
+    rmSync(g.path, { recursive: true })
+    renameSync(moved, g.path)
+    g.advance(1_000)
+    await g.q.pump()
+    expect(g.sent).toEqual(['A', 'B']) // A went out once, and its removal finished after the read recovered
+  })
+
+  test('a missing file and an empty file still clear the in-flight state', async () => {
+    const g = gatedSetup()
+    await g.open()
+    g.write('idle', SETTLE_MS)
+    await g.q.enqueue(note('A'))
+    expect(g.q.stats().inFlight).toBe(true)
+    rmSync(g.path)
+    await g.q.pump()
+    expect(g.q.stats().inFlight).toBe(false)
+    await g.q.enqueue(note('B'))
+    writeFileSync(g.path, '')
+    await g.q.pump()
+    expect(g.q.stats().inFlight).toBe(false)
   })
 })
