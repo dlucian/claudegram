@@ -404,8 +404,11 @@ export function createQueue(opts: QueueOptions): Queue {
     }
   }
 
-  /** Sends the head once. Returns false, with the head kept, when the send rejects or times out. */
-  async function sendHead(head: QueueEntry, attempts: number): Promise<number | null> {
+  /**
+   * Sends the head once and returns the time just before the send, or null, with the head kept, when the send
+   * rejects or times out. `persist` records the send count in the queue line, for an entry that stays queued.
+   */
+  async function sendHead(head: QueueEntry, attempts: number, persist: boolean): Promise<number | null> {
     if (opts.onRelease) {
       try {
         await withTimeout(opts.onRelease(head.notification, { fresh: head.key === appendedKey }), 3_000, 'release hook')
@@ -423,10 +426,12 @@ export function createQueue(opts: QueueOptions): Queue {
       return null
     }
     remember(sentKeys, head.key)
-    try {
-      setAttempts(path, head.key, attempts)
-    } catch (err) {
-      log(`cannot record the send count: ${err}`)
+    if (persist) {
+      try {
+        setAttempts(path, head.key, attempts)
+      } catch (err) {
+        log(`cannot record the send count: ${err}`)
+      }
     }
     return sentAt
   }
@@ -457,7 +462,7 @@ export function createQueue(opts: QueueOptions): Queue {
       flight = null
       return removeHead(head)
     }
-    if ((await sendHead(head, (head.attempts ?? 0) + 1)) === null) return false
+    if ((await sendHead(head, (head.attempts ?? 0) + 1, false)) === null) return false
     return removeHead(head)
   }
 
@@ -487,7 +492,7 @@ export function createQueue(opts: QueueOptions): Queue {
       if (acked || t - f.sentAt < ACK_TIMEOUT_MS) return false
       // The session wrote nothing since the send: the notification probably never became a turn.
       if (f.attempts >= MAX_ATTEMPTS) return giveUp(head)
-      const sentAt = await sendHead(head, f.attempts + 1)
+      const sentAt = await sendHead(head, f.attempts + 1, true)
       if (sentAt !== null) flight = { key: head.key, sentAt, attempts: f.attempts + 1 }
       return false
     }
@@ -509,7 +514,7 @@ export function createQueue(opts: QueueOptions): Queue {
     // An entry that an earlier process persisted proves the hooks ran there; a fresh one needs a state file here.
     const track = release === 'now' && (state !== null || sawState || !ownKeys.has(head.key))
     const attempts = (head.attempts ?? 0) + 1
-    const sentAt = await sendHead(head, attempts)
+    const sentAt = await sendHead(head, attempts, track)
     if (sentAt === null) return false
     if (release === 'fail-open') lastFailOpenAt = t
     if (track) {
