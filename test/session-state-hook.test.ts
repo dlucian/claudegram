@@ -110,6 +110,21 @@ describe('events', () => {
     }
   })
 
+  test('writes through a temporary file and a rename', () => {
+    const s = setup()
+    const bin = join(s.root, 'shim')
+    mkdirSync(bin)
+    const real = Bun.spawnSync(['which', 'mv']).stdout.toString().trim()
+    const record = join(s.root, 'mv.log')
+    writeFileSync(bin + '/mv', `#!/bin/sh\nprintf '%s -> %s\\n' "$2" "$3" >> '${record}'\nexec ${real} "$@"\n`)
+    chmodSync(bin + '/mv', 0o755)
+    run('busy', s, '{}', { PATH: `${bin}:${process.env.PATH}` })
+    const log = readFileSync(record, 'utf8').trim()
+    const dir = join(s.stateDir, 'session-state')
+    expect(log).toMatch(new RegExp(`^${dir}/\\.4242\\.\\d+\\.tmp -> ${dir}/4242$`))
+    expect(word(s.file())).toBe('busy')
+  })
+
   test('creates the state directory with owner-only permissions', () => {
     const s = setup()
     run('idle', s)
