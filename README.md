@@ -16,6 +16,7 @@ The single MCP server (`server.ts`) extends the stock plugin with:
 - 📝 **Transcripts** — append-only inbound/outbound transcript logging (with Telegram-side timestamps) for durable history beyond Telegram's no-history Bot API.
 - ✍️ **Markdown that just works** — write natural Markdown (`*bold*`, `_italic_`, `` `code` ``, `[text](url)`); the plugin escapes to MarkdownV2 for you (an audit of historical replies showed a ~13% escape-failure rate when callers hand-rolled escapes — this kills that class of bug).
 - 📍 **Location ingest** — handles inbound location/pin messages.
+- 🫡 **Hold until idle** — a message that arrives mid-turn waits in the queue until the session is idle, so it starts its own turn instead of folding into the running one with a mid-turn note. See [Message queueing](#message-queueing).
 
 ## Bundled hooks (operator-specific)
 
@@ -27,6 +28,36 @@ The single MCP server (`server.ts`) extends the stock plugin with:
 
 - 🧵 **Auto reply-threading** — ✅ shipped as part of the auto-send hook above (parses the trigger message_id; falls back to un-threaded for terminal-typed turns).
 - 🛠️ **Live tool-use display** — a single self-updating message showing what the agent is doing in real time.
+
+## Message queueing
+
+The plugin holds each inbound message in `pending_notifications.jsonl` until the session that owns the channel is idle, then delivers one message and waits for that turn to end before it delivers the next. Without this, a message that arrives mid-turn folds into the running turn with a mid-turn note, and the session can decline it.
+
+**How it works**
+
+- Hooks in `hooks/hooks.json` run `hooks/session-state.sh`, which writes `busy` or `idle` to `$TELEGRAM_STATE_DIR/session-state/<claude_pid>`. The plugin reads only the file of its own `claude` ancestor, so another session can't mark it busy or idle.
+- A held message gets a 🫡 reaction. The plugin clears the reaction when it releases the message. Reactions and `ask` taps queue in order without a 🫡, and an `ask` tap shows a `Queued: <label>` toast instead of `Sent: <label>`.
+- The plugin keeps a delivered message in the queue until the turn it starts ends, because `mcp.notification` resolving doesn't prove that the harness registered its channel handler. If the session writes no state within 30 seconds, the plugin sends the message again, up to three times, and then tells you that it dropped the message.
+- Permission requests, `yes xxxxx` replies, and `perm:` buttons never queue.
+
+**Every uncertain state delivers.** A missing or unreadable state file, a `busy` marker older than 15 minutes, and a message that waited longer than 30 minutes all release the message. The cost of a wrong signal is a labeled or duplicate message, never a message that waits forever.
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `POLL_MS` | 1 s | How often the queue file is checked. |
+| `SETTLE_MS` | 3 s | How long the state must stay `idle` before a release. |
+| `STALE_BUSY_MS` | 15 min | A `busy` marker not rewritten for this long no longer counts. |
+| `MAX_HOLD_MS` | 30 min | The longest a message waits under a fresh `busy` marker. |
+| `ACK_TIMEOUT_MS` | 30 s | How long a delivered message waits for any state write before the resend. |
+| `MAX_ATTEMPTS` | 3 | The most sends of one message without a turn. |
+
+**Check it.** Send `/status` to the bot. It reports the session state, how many messages are held, and whether queueing is off.
+
+**Turn it off.** Create `$TELEGRAM_STATE_DIR/queue-disabled`. While the file exists, the plugin sends every entry at once and removes it at send. Delete the file to turn queueing back on.
+
+**Roll back.** `ezri-claudegram-rollback` switches to the official plugin, which doesn't read the queue the same way. Check that the queue is empty first, or create `queue-disabled` and wait for it to drain.
+
+The hook needs `jq` to tell a subagent's tool call from the main thread. Without `jq` the hook still works, but a tool call can't turn an idle session busy.
 
 ## Status
 
