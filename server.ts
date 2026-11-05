@@ -25,7 +25,9 @@ import { join, extname, sep } from 'path'
 import { execSync, spawn } from 'child_process'
 import { formatPermissionPrompt } from './permission-format.ts'
 import { isPluginWrapper } from './stale-poller.ts'
-import { BOOT_GRACE_MS, createQueue } from './notif-queue.ts'
+import {
+  BOOT_GRACE_MS, POLL_MS, QUEUED_REACTION, createQueue, readSessionState, sweepDeadStateFiles,
+} from './notif-queue.ts'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -206,6 +208,11 @@ if (!TOKEN) {
 // user's interactive poller via the stale-poller scan below. Telegram's
 // Bot API allows exactly one getUpdates consumer per token, so only the
 // session that actually wants inbound messages should claim it.
+// The nearest `claude` ancestor is also the owner of the session-state marker:
+// hooks/session-state.sh writes `session-state/<pid>` for the same process.
+// Null when the walk finds no claude, and delivery then treats the marker as
+// missing and sends at once.
+let ownerPid: number | null = null
 try {
   let pid = process.ppid
   for (let i = 0; i < 8 && pid > 1; i++) {
@@ -214,6 +221,7 @@ try {
       if (!/--channels[= ]\S*\btelegram\b/.test(cmd)) {
         process.exit(0)
       }
+      ownerPid = pid
       break
     }
     const ppidLine = execSync(`ps -p ${pid} -o ppid=`, { encoding: 'utf8' }).trim()
@@ -1201,6 +1209,14 @@ function shutdown(): void {
   try {
     if (parseInt(readFileSync(PID_FILE, 'utf8'), 10) === process.pid) rmSync(PID_FILE)
   } catch {}
+  // Stop delivering. The queue file stays, so the next plugin process replays
+  // whatever was still held. The session-state marker stays too: it belongs to
+  // the claude process, which can outlive this MCP server (a restart inside the
+  // same session), and deleting a live `busy` marker would release held
+  // messages into the running turn. sweepDeadStateFiles removes it once that
+  // process is dead. `queue` is declared further down, so a shutdown that fires
+  // first just skips it.
+  try { queue.close() } catch {}
   // bot.stop() signals the poll loop to end; the current getUpdates request
   // may take up to its long-poll timeout to return. Force-exit after 2s.
   setTimeout(() => process.exit(0), 2000)
@@ -1273,7 +1289,7 @@ bot.command('status', async ctx => {
 
   if (access.allowFrom.includes(senderId)) {
     const name = ctx.from!.username ? `@${ctx.from!.username}` : senderId
-    await ctx.reply(`Paired as ${name}.`)
+    await ctx.reply(`Paired as ${name}.\n${queueStatusLine()}`)
     return
   }
 
@@ -1399,7 +1415,7 @@ bot.on('callback_query:data', async ctx => {
     const safeLabel = sanitizeAskText(label)
     const safeQuestion = sanitizeAskText(entry.question)
 
-    await notifyOrQueue({
+    const askStatus = await notifyOrQueue({
       method: 'notifications/claude/channel',
       params: {
         content: `Tapped "${safeLabel}" in answer to: ${safeQuestion}`,
@@ -1421,7 +1437,8 @@ bot.on('callback_query:data', async ctx => {
       user: ctx.from.username ?? String(ctx.from.id),
     }, `[ask answer] ${safeLabel} (to: ${safeQuestion})`)
 
-    await ctx.answerCallbackQuery({ text: `Sent: ${label}` }).catch(() => {})
+    // No 🫡 here: the tapped message is the bot's own, so the toast is the only queued marker.
+    await ctx.answerCallbackQuery({ text: `${askStatus === 'held' ? 'Queued' : 'Sent'}: ${label}` }).catch(() => {})
     // Replace the buttons with the outcome so it can't be tapped twice and the
     // chat history records the choice. Re-render with the SAME format the
     // original question used — otherwise a markdown ask loses its formatting on
@@ -2003,7 +2020,7 @@ async function handleInbound(
 
   // image_path goes in meta only — an in-content "[image attached — read: PATH]"
   // annotation is forgeable by any allowlisted sender typing that string.
-  await notifyOrQueue({
+  const status = await notifyOrQueue({
     method: 'notifications/claude/channel',
     params: {
       content: text,
@@ -2026,6 +2043,10 @@ async function handleInbound(
       },
     },
   })
+
+  // A held message gets 🫡 so Lucian can tell it is queued, not lost. An edited
+  // message (a live location update) has no message id, so it gets none.
+  if (status === 'held' && msgId != null) void markQueued(chat_id, msgId)
 
   // ezri#12: capture this inbound to the daily transcript file.
   // Pass Telegram's ctx.message.date so durable-inbound replays (patch 003)
@@ -2053,20 +2074,117 @@ async function handleInbound(
 // Durable inbound delivery. Telegram's getUpdates advances the offset
 // regardless of downstream success, so a message gets one shot. Every channel
 // notification therefore goes through the on-disk queue in notif-queue.ts:
-// append a line, send the head, and remove that line by identity once the send
-// resolves. A line appended during a send survives, and an unparsable line
-// moves to the corrupt file instead of blocking the entries behind it.
+// append a line, hold it until the session is idle, send one entry, and keep it
+// until that entry's turn ends (dlucian/ezri#474). A line appended during a
+// send survives, and an unparsable line moves to the corrupt file instead of
+// blocking the entries behind it. Permission relays never use the queue.
 const NOTIF_QUEUE = join(STATE_DIR, 'pending_notifications.jsonl')
 const NOTIF_CORRUPT = join(STATE_DIR, 'pending_notifications.corrupt.jsonl')
+// While this file exists, every entry is sent and removed at once (the kill switch).
+const QUEUE_DISABLED = join(STATE_DIR, 'queue-disabled')
 const log = (message: string) => process.stderr.write(`telegram channel: ${message}\n`)
-const queue = createQueue({ path: NOTIF_QUEUE, corruptPath: NOTIF_CORRUPT, send: n => mcp.notification(n), log })
+
+/**
+ * Only the process that bot.pid names delivers. An unreadable file, or a PID
+ * that no longer runs, means deliver: a duplicate beats a message that waits
+ * for a process that is gone.
+ */
+function ownsBot(): boolean {
+  try {
+    const pid = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
+    if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) return true
+    try {
+      process.kill(pid, 0)
+      return false
+    } catch (err) {
+      return (err as NodeJS.ErrnoException).code === 'ESRCH'
+    }
+  } catch {
+    return true
+  }
+}
+
+// Messages that already left the queue. A 🫡 that lands after the release
+// would stay until the session reacts, so markQueued checks this set again.
+const releasedMessages = new Set<string>()
+
+/** Replaces the bot's reaction with the one the access file configures, or none. */
+async function clearQueuedReaction(chat_id: string, msgId: number): Promise<void> {
+  const ack = loadAccess().ackReaction
+  await bot.api.setMessageReaction(
+    chat_id,
+    msgId,
+    ack ? [{ type: 'emoji', emoji: ack as ReactionTypeEmoji['emoji'] }] : [],
+  )
+}
+
+async function markQueued(chat_id: string, msgId: number): Promise<void> {
+  const id = `${chat_id}:${msgId}`
+  try {
+    await bot.api.setMessageReaction(chat_id, msgId, [
+      { type: 'emoji', emoji: QUEUED_REACTION as ReactionTypeEmoji['emoji'] },
+    ])
+    if (releasedMessages.has(id)) await clearQueuedReaction(chat_id, msgId)
+  } catch (err) {
+    log(`queued reaction failed (${err}); the message stays queued`)
+  }
+}
+
+const queue = createQueue({
+  path: NOTIF_QUEUE,
+  corruptPath: NOTIF_CORRUPT,
+  send: n => mcp.notification(n),
+  log,
+  readState: () => readSessionState(STATE_DIR, ownerPid),
+  disabled: () => existsSync(QUEUE_DISABLED),
+  isOwner: ownsBot,
+  pollMs: POLL_MS,
+  warn: async (entry, text) => {
+    const meta = (entry.notification.params as { meta?: Record<string, unknown> } | undefined)?.meta
+    if (typeof meta?.chat_id === 'string') await bot.api.sendMessage(meta.chat_id, text)
+  },
+  onRelease: async (n, { fresh }) => {
+    const meta = (n.params as { meta?: Record<string, unknown> } | undefined)?.meta
+    const chat_id = meta?.chat_id
+    const message_id = meta?.message_id
+    // Reactions and ask taps point at another message and never got a 🫡.
+    if (typeof chat_id !== 'string' || typeof message_id !== 'string') return
+    if (meta?.kind === 'reaction' || meta?.kind === 'ask_answer') return
+    const msgId = parseInt(message_id, 10)
+    if (!Number.isInteger(msgId)) return
+    releasedMessages.add(`${chat_id}:${msgId}`)
+    if (releasedMessages.size > 512) releasedMessages.delete(releasedMessages.values().next().value as string)
+    if (fresh) return // never waited, so it carries no 🫡
+    // The queue calls this after the send resolved, so a failed send keeps the 🫡.
+    // Do not wait for Telegram: a slow API call must not delay the queue.
+    void clearQueuedReaction(chat_id, msgId).catch(err => log(`cannot clear the queued reaction (${err})`))
+  },
+})
+// Drop markers whose claude process is gone, so a stale `busy` from a killed
+// session can never be read by a later one that reuses the PID. This is the
+// only place a marker is removed.
+sweepDeadStateFiles(STATE_DIR, log)
 // A notification sent before the harness registers its channel handler
-// probably disappears, so wait before the first flush. Messages queued before
-// a restart go out when the timer fires.
+// can disappear, so wait before the first pump. The queue also keeps each entry
+// until its turn ends, which covers a notification that is lost anyway.
+// Messages queued before a restart go out when the timer fires.
 setTimeout(() => queue.open(), BOOT_GRACE_MS)
 
-async function notifyOrQueue(entry: { method: string; params: unknown }): Promise<void> {
-  await queue.enqueue(entry)
+async function notifyOrQueue(entry: { method: string; params: unknown }): Promise<'sent' | 'held'> {
+  return queue.enqueue(entry)
+}
+
+/** One line for /status: the session state, the queue depth, and the kill switch. */
+function queueStatusLine(): string {
+  const { depth, inFlight } = queue.stats()
+  const state = readSessionState(STATE_DIR, ownerPid)
+  const session = state
+    ? `${state.state} for ${Math.max(0, Math.round((Date.now() - state.mtimeMs) / 1000))} s`
+    : ownerPid === null
+      ? 'unknown (no claude process found), so messages deliver at once'
+      : 'unknown (the hooks wrote no state), so messages deliver at once'
+  const off = existsSync(QUEUE_DISABLED) ? ' Queueing is off: queue-disabled exists.' : ''
+  return `Session: ${session}. Queue: ${depth} held${inFlight ? ', 1 sent and awaiting its turn' : ''}.${off}`
 }
 
 // Without this, any throw in a message handler stops polling permanently

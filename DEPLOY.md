@@ -23,10 +23,13 @@ This fork **is** the source of truth. There is no patch layer any more (the old
 6. **Verify** the new cache byte-matches the fork before trusting it.
    `server.ts` imports `permission-format.ts`, `stale-poller.ts`, and
    `notif-queue.ts`, so compare all four files: a cache with a stale or missing
-   import fails at startup even when `server.ts` matches.
+   import fails at startup even when `server.ts` matches. Compare the hook
+   files too: `hooks/session-state.sh` writes the busy or idle marker that the
+   queue reads, and `hooks/hooks.json` registers it.
    ```
    V=$(python3 -c "import json;print(json.load(open('.claude-plugin/plugin.json'))['version'])")
-   for f in server.ts permission-format.ts stale-poller.ts notif-queue.ts; do
+   for f in server.ts permission-format.ts stale-poller.ts notif-queue.ts \
+            hooks/session-state.sh hooks/hooks.json; do
      diff <(git show HEAD:$f) \
        "$HOME/.claude/plugins/cache/claudegram/telegram/$V/$f" && echo "OK $f"
    done
