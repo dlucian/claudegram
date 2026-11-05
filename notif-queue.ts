@@ -343,8 +343,12 @@ export type QueueOptions = {
   isOwner?: () => boolean
   /** Tells the user an entry was dropped after `MAX_ATTEMPTS` sends. A rejection is logged and never blocks the queue. */
   warn?: (entry: QueueEntry, text: string) => Promise<unknown>
-  /** Runs before each send, for example to clear the queued reaction. A rejection is logged and never blocks the queue. */
-  onRelease?: (notification: Notification) => Promise<unknown>
+  /**
+   * Runs before each send, for example to clear the queued reaction. `fresh` is true when the entry was appended by
+   * the `enqueue` call that is releasing it, so it never waited and has no queued marker. A rejection is logged and
+   * never blocks the queue.
+   */
+  onRelease?: (notification: Notification, info: { fresh: boolean }) => Promise<unknown>
   now?: () => number
   /** How long a send may take before it counts as rejected. Defaults to `SEND_TIMEOUT_MS`. */
   sendTimeoutMs?: number
@@ -382,6 +386,8 @@ export function createQueue(opts: QueueOptions): Queue {
   let removeOnly: string | null = null
   let lastFailOpenAt = -Infinity
   let blockedUntil = 0
+  /** The key that the running `enqueue` call appended, while that call runs the loop itself. */
+  let appendedKey: string | null = null
 
   function remember(set: Set<string>, key: string): void {
     set.add(key)
@@ -402,7 +408,7 @@ export function createQueue(opts: QueueOptions): Queue {
   async function sendHead(head: QueueEntry, attempts: number): Promise<number | null> {
     if (opts.onRelease) {
       try {
-        await withTimeout(opts.onRelease(head.notification), 3_000, 'release hook')
+        await withTimeout(opts.onRelease(head.notification, { fresh: head.key === appendedKey }), 3_000, 'release hook')
       } catch (err) {
         log(`release hook failed, sending anyway: ${err}`)
       }
@@ -594,8 +600,12 @@ export function createQueue(opts: QueueOptions): Queue {
         return 'sent'
       }
       remember(ownKeys, key)
+      appendedKey = key
       const started = run(false)
-      if (started) await started
+      if (!started) appendedKey = null
+      else {
+        try { await started } finally { appendedKey = null }
+      }
       return sentKeys.has(key) ? 'sent' : 'held'
     },
     pump,

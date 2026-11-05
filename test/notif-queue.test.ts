@@ -469,10 +469,30 @@ describe('server.ts wiring', () => {
     expect(src).toMatch(/import \{[^}]*\bcreateQueue\b[^}]*\} from '\.\/notif-queue\.ts'/)
     expect(src).toMatch(/const NOTIF_CORRUPT = join\(STATE_DIR, 'pending_notifications\.corrupt\.jsonl'\)/)
     expect(src).toMatch(/const log = \(message: string\)/)
-    expect(src).toMatch(/createQueue\(\{[^}]*corruptPath: NOTIF_CORRUPT[^}]*log[^}]*\}\)/)
+    expect(src).toMatch(/createQueue\(\{\s*path: NOTIF_QUEUE,\s*corruptPath: NOTIF_CORRUPT,[\s\S]*?\n  log,/)
     expect(src).toMatch(/setTimeout\(\(\) => queue\.open\(\), BOOT_GRACE_MS\)/)
     expect(src).not.toContain('flushQueue')
-    expect(src).toMatch(/await queue\.enqueue\(entry\)/)
+    expect(src).toMatch(/return queue\.enqueue\(entry\)/)
+  })
+
+  test('server.ts wires the session gate to the owner PID, bot.pid, and the kill switch', () => {
+    expect(src).toMatch(/ownerPid = pid\n\s*break/) // the nearest claude ancestor
+    expect(src).toMatch(/readState: \(\) => readSessionState\(STATE_DIR, ownerPid\)/)
+    expect(src).toMatch(/const QUEUE_DISABLED = join\(STATE_DIR, 'queue-disabled'\)/)
+    expect(src).toMatch(/disabled: \(\) => existsSync\(QUEUE_DISABLED\)/)
+    expect(src).toMatch(/isOwner: ownsBot/)
+    expect(src).toMatch(/code === 'ESRCH'/) // a dead bot.pid owner does not hold the queue
+    expect(src).toMatch(/pollMs: POLL_MS/)
+    expect(src).toMatch(/sweepDeadStateFiles\(STATE_DIR, log\)/)
+    expect(src).toMatch(/try \{ queue\.close\(\) \}/)
+  })
+
+  test('a held text message gets the queued reaction, and an ask tap gets a Queued toast', () => {
+    expect(src).toMatch(/if \(status === 'held' && msgId != null\) void markQueued\(chat_id, msgId\)/)
+    expect(src).toMatch(/askStatus === 'held' \? 'Queued' : 'Sent'/)
+    // Reactions are queued in order and never get a reaction of their own.
+    const reaction = src.slice(src.indexOf("bot.on('message_reaction'"))
+    expect(reaction.slice(0, 3500)).not.toContain('markQueued')
   })
 
   test('permission notifications never pass through the queue', () => {
@@ -1060,6 +1080,21 @@ describe('what is queued and who delivers', () => {
     g.write('idle', SETTLE_MS)
     await g.q.enqueue(note('A'))
     expect(order).toEqual(['release', 'send'])
+  })
+
+  test('tells the release hook whether the entry waited', async () => {
+    const seen: [string, boolean][] = []
+    const g = gatedSetup({ onRelease: async (n, info) => { seen.push([content(n), info.fresh]) } })
+    await g.open()
+    g.write('idle', SETTLE_MS)
+    await g.q.enqueue(note('immediate')) // appended and released by the same call
+    g.advance(1_000); g.write('busy')
+    await g.q.enqueue(note('waited'))
+    g.advance(1_000); g.write('idle')
+    await g.q.pump() // removes "immediate"
+    g.advance(SETTLE_MS)
+    await g.q.pump() // releases "waited" from a later pass
+    expect(seen).toEqual([['immediate', true], ['waited', false]])
   })
 
   test('close stops delivery and the poll timer', async () => {
