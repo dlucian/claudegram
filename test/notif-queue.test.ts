@@ -489,6 +489,17 @@ describe('server.ts wiring', () => {
     expect(src).toMatch(/try \{ queue\.close\(\) \}/)
   })
 
+  test('the release callback records the release before it skips a fresh entry, and markQueued re-checks it', () => {
+    // server.ts can't be run without starting the bot, so this checks the text. The order matters when a send
+    // times out: enqueue returns `held`, markQueued sets the marker, and the late release must clear it even if
+    // it fires before markQueued has finished.
+    const cb = src.slice(src.indexOf('onRelease: async'))
+    expect(cb.indexOf('releasedMessages.add(')).toBeGreaterThan(0)
+    expect(cb.indexOf('releasedMessages.add(')).toBeLessThan(cb.indexOf('if (fresh) return'))
+    const mark = src.slice(src.indexOf('async function markQueued'), src.indexOf('const queue = createQueue'))
+    expect(mark).toMatch(/setMessageReaction[\s\S]*releasedMessages\.has\(id\)\) await clearQueuedReaction/)
+  })
+
   test('a held text message gets the queued reaction, and an ask tap gets a Queued toast', () => {
     expect(src).toMatch(/if \(status === 'held' && msgId != null\) void markQueued\(chat_id, msgId\)/)
     expect(src).toMatch(/askStatus === 'held' \? 'Queued' : 'Sent'/)
@@ -962,6 +973,75 @@ describe('in flight', () => {
       await g.q.pump()
     }
     expect(queued(g.path, g.corruptPath)).toEqual(['A'])
+  })
+
+  test('a fresh send that times out and resolves late releases the entry as one that waited', async () => {
+    // enqueue returned `held`, so the caller sets the queued marker. The late release must clear it.
+    const seen: [string, boolean][] = []
+    let finish: () => void = () => {}
+    const g = gatedSetup({
+      send: () => new Promise<void>(r => { finish = r }),
+      sendTimeoutMs: 20,
+      onRelease: async (n, info) => { seen.push([content(n), info.fresh]) },
+    })
+    await g.open()
+    g.write('idle', SETTLE_MS)
+    expect(await g.q.enqueue(note('A'))).toBe('held')
+    expect(seen).toEqual([])
+    finish()
+    await new Promise(r => setTimeout(r, 10))
+    expect(seen).toEqual([['A', false]])
+  })
+
+  test('a fresh send that resolves in time is still released as fresh', async () => {
+    const seen: boolean[] = []
+    const g = gatedSetup({ onRelease: async (_n, info) => { seen.push(info.fresh) } })
+    await g.open()
+    g.write('idle', SETTLE_MS)
+    expect(await g.q.enqueue(note('A'))).toBe('sent')
+    expect(seen).toEqual([true])
+  })
+
+  test('two timed-out sends that resolve out of order keep the higher attempt count across a restart', async () => {
+    const finishers: (() => void)[] = []
+    const g = gatedSetup({
+      send: () => new Promise<void>(r => { finishers.push(r) }),
+      sendTimeoutMs: 10,
+    })
+    await g.open()
+    g.write('idle', SETTLE_MS)
+    await g.q.enqueue(note('A')) // send 1 times out: attempts 1
+    g.advance(ACK_TIMEOUT_MS)
+    await g.q.pump() // the no-turn rule resends: send 2 times out, attempts 2
+    expect(finishers).toHaveLength(2)
+    const attempts = () => readEntries(g.path, g.corruptPath, () => {})[0]!.attempts
+    expect(attempts()).toBe(2)
+    finishers[1]!() // the later send resolves first
+    await new Promise(r => setTimeout(r, 10))
+    finishers[0]!() // then the earlier one records attempt 1
+    await new Promise(r => setTimeout(r, 10))
+    expect(attempts()).toBe(2)
+    // A restarted queue keeps counting from 2, so the third send is the last.
+    g.q.close()
+    const sent2: string[] = []
+    const again = createQueue({
+      path: g.path, corruptPath: g.corruptPath, log: () => {}, send: async n => { sent2.push(content(n)) },
+      readState: () => g.world.state, now: () => g.clock.t,
+    })
+    again.open()
+    await new Promise(r => setTimeout(r, 10))
+    expect(sent2).toEqual(['A'])
+    expect(attempts()).toBe(3)
+  })
+
+  test('setAttempts never lowers the count', () => {
+    const { path, corruptPath } = setup()
+    const id = appendEntry(path, note('A'))
+    setAttempts(path, id, 2)
+    setAttempts(path, id, 1)
+    expect(readEntries(path, corruptPath, () => {})[0]!.attempts).toBe(2)
+    setAttempts(path, id, 3)
+    expect(readEntries(path, corruptPath, () => {})[0]!.attempts).toBe(3)
   })
 
   test('a timed-out send without a state file stays in flight instead of being removed at send', async () => {

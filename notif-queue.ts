@@ -321,7 +321,10 @@ export function setAttempts(path: string, key: string, attempts: number, log: Lo
   rewriteLines(path, line => {
     const parsed = parseLine(line)
     if (!parsed?.hasId || parsed.key !== key) return undefined
-    return JSON.stringify({ ...(JSON.parse(line) as Record<string, unknown>), _attempts: attempts })
+    // Never lower the count: sends that timed out can resolve out of order, and a late record of an earlier send
+    // would otherwise reset the count of a later one.
+    const count = Math.max(parsed.attempts ?? 0, attempts)
+    return JSON.stringify({ ...(JSON.parse(line) as Record<string, unknown>), _attempts: count })
   }, log)
 }
 
@@ -575,7 +578,9 @@ export function createQueue(opts: QueueOptions): Queue {
         () => {
           mine.state = 'ok'
           record() // late delivery: count it, and release the entry's marker
-          void releaseHook(head, fresh)
+          // The attempt timed out, so `enqueue` already returned `held` and the caller may have set the queued
+          // marker. Report the entry as one that waited, so the marker is cleared.
+          void releaseHook(head, false)
         },
         late => {
           mine.state = 'failed'
