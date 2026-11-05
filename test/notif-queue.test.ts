@@ -1,11 +1,13 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import {
-  appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync,
+  appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, utimesSync,
+  writeFileSync,
 } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import {
-  ACK_TIMEOUT_MS, appendEntry, BOOT_GRACE_MS, createQueue, FAIL_OPEN_SPACING_MS, MAX_ATTEMPTS, MAX_HOLD_MS,
+  ACK_TIMEOUT_MS, appendEntry, BOOT_GRACE_MS, createQueue, FAIL_OPEN_SPACING_MS, LOCK_STALE_MS, LOCK_WAIT_MS,
+  MAX_ATTEMPTS, MAX_HOLD_MS, withQueueLock,
   QUEUED_REACTION, readEntries, readSessionState, removeEntry, SEND_RETRY_MS, setAttempts, SETTLE_MS, STALE_BUSY_MS,
   sweepDeadStateFiles, type Notification, type SessionState,
 } from '../notif-queue.ts'
@@ -1125,5 +1127,206 @@ describe('what is queued and who delivers', () => {
     expect(source).not.toMatch(/queue\.enqueue\(\{\s*method: 'notifications\/claude\/channel\/permission/)
     // The queue is only entered through notifyOrQueue.
     expect([...source.matchAll(/queue\.enqueue\(/g)].length).toBe(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Review round 1 folds (dlucian/ezri#474).
+
+describe('recheck before send', () => {
+  test('keeps the entry queued, and its queued reaction, when the session became busy after the decision', async () => {
+    let reads = 0
+    const g = gatedSetup()
+    const q = createQueue({
+      path: g.path, corruptPath: g.corruptPath, log: () => {}, send: async n => { g.sent.push(content(n)) },
+      // The decision sees an idle, settled session. By the recheck a terminal prompt has started a turn.
+      readState: () => (++reads <= 1 ? { state: 'idle', mtimeMs: g.clock.t - SETTLE_MS } : { state: 'busy', mtimeMs: g.clock.t }),
+      onRelease: async n => { g.released.push(content(n)) },
+      now: () => g.clock.t,
+    })
+    q.open()
+    await new Promise(r => setTimeout(r, 10))
+    reads = 0
+    expect(await q.enqueue(note('A'))).toBe('held')
+    expect(g.sent).toEqual([])
+    expect(g.released).toEqual([]) // the release hook, which clears the reaction, never ran
+    expect(queued(g.path, g.corruptPath)).toEqual(['A'])
+    expect(q.stats().inFlight).toBe(false)
+  })
+
+  test('sends once the recheck sees the session idle again', async () => {
+    const g = gatedSetup()
+    await g.open()
+    g.write('busy')
+    await g.q.enqueue(note('A'))
+    g.write('idle')
+    g.advance(SETTLE_MS)
+    await g.q.pump()
+    expect(g.sent).toEqual(['A'])
+  })
+
+  test('does not resend when the session wrote its state between the check and the resend', async () => {
+    const g = gatedSetup()
+    const script: (SessionState | null)[] = []
+    const q = createQueue({
+      path: g.path, corruptPath: g.corruptPath, log: () => {}, send: async n => { g.sent.push(content(n)) },
+      readState: () => (script.length > 1 ? script.shift()! : script[0] ?? null),
+      now: () => g.clock.t,
+    })
+    q.open()
+    await new Promise(r => setTimeout(r, 10))
+    script.push({ state: 'idle', mtimeMs: g.clock.t - SETTLE_MS })
+    await q.enqueue(note('A'))
+    expect(g.sent).toEqual(['A'])
+    const sentAt = g.clock.t
+    g.advance(ACK_TIMEOUT_MS)
+    // The pass reads no write since the send, so it decides to resend. The recheck sees the turn start.
+    script.splice(0, script.length, { state: 'idle', mtimeMs: sentAt - 1 }, { state: 'busy', mtimeMs: sentAt + 1 })
+    await q.pump()
+    expect(g.sent).toEqual(['A'])
+    expect(readEntries(g.path, g.corruptPath, () => {})[0]!.attempts).toBe(1)
+  })
+})
+
+describe('queue lock', () => {
+  const child = join(import.meta.dir, 'fixtures', 'append-child.ts')
+
+  test('an append from a second process while a rewrite holds the lock survives', async () => {
+    const { path, corruptPath, dir } = setup()
+    const ready = join(dir, 'child-ready')
+    const idA = appendEntry(path, note('A'))
+    appendEntry(path, note('B'))
+    let proc!: ReturnType<typeof Bun.spawn>
+    // This block is what removeEntry does: read, drop a line, rename. The second
+    // process starts appending after the read and before the rename.
+    withQueueLock(path, () => {}, () => {
+      const snapshot = readFileSync(path, 'utf8').split('\n').filter(l => l.trim())
+      proc = Bun.spawn(['bun', child, path, ready, 'from the second process'], { stdout: 'ignore', stderr: 'ignore' })
+      const end = Date.now() + 10_000
+      while (!existsSync(ready) && Date.now() < end) Bun.sleepSync(2)
+      Bun.sleepSync(30) // the child now waits for the lock, which it gives up after LOCK_WAIT_MS
+      const kept = snapshot.filter(l => !l.includes(`"${idA}"`))
+      writeFileSync(`${path}.tmp-x`, kept.join('\n') + '\n')
+      renameSync(`${path}.tmp-x`, path)
+    })
+    await proc.exited
+    expect(queued(path, corruptPath)).toEqual(['B', 'from the second process'])
+  })
+
+  test('removeEntry holds the lock while it rewrites', () => {
+    const { path } = setup()
+    const id = appendEntry(path, note('A'))
+    appendEntry(path, note('B'))
+    // A busy lock makes removeEntry wait for LOCK_WAIT_MS and then go ahead.
+    writeFileSync(`${path}.lock`, 'someone else')
+    const logs: string[] = []
+    const started = Date.now()
+    removeEntry(path, id, m => logs.push(m))
+    expect(Date.now() - started).toBeGreaterThanOrEqual(LOCK_WAIT_MS - 20)
+    expect(logs.some(m => m.includes('continuing without it'))).toBe(true)
+    expect(readFileSync(path, 'utf8')).not.toContain('"A"')
+  })
+
+  test('a stale lock does not block', () => {
+    const { path } = setup()
+    writeFileSync(`${path}.lock`, 'crashed process')
+    const old = new Date(Date.now() - LOCK_STALE_MS - 1_000)
+    utimesSync(`${path}.lock`, old, old)
+    const logs: string[] = []
+    const started = Date.now()
+    appendEntry(path, note('A'), Date.now(), m => logs.push(m))
+    expect(Date.now() - started).toBeLessThan(LOCK_WAIT_MS - 50)
+    expect(logs).toEqual([])
+    expect(existsSync(`${path}.lock`)).toBe(false) // taken over, then released
+    expect(readFileSync(path, 'utf8')).toContain('"A"')
+  })
+
+  test('an unacquirable lock still appends', () => {
+    const { path, corruptPath } = setup()
+    writeFileSync(`${path}.lock`, 'held by a live process') // fresh, so not stale
+    const logs: string[] = []
+    appendEntry(path, note('A'), Date.now(), m => logs.push(m))
+    expect(queued(path, corruptPath)).toEqual(['A'])
+    expect(logs.some(m => m.includes('continuing without it'))).toBe(true)
+    expect(readFileSync(`${path}.lock`, 'utf8')).toBe('held by a live process') // never released by a non-holder
+  })
+
+  test('a lock that cannot be created still appends', () => {
+    const { path, corruptPath } = setup()
+    mkdirSync(`${path}.lock`) // a directory: EEXIST but never stale-breakable by rm without recursion
+    const old = new Date(Date.now() - 60_000)
+    utimesSync(`${path}.lock`, old, old)
+    appendEntry(path, note('A'))
+    expect(queued(path, corruptPath)).toEqual(['A'])
+  })
+
+  test('releases the lock when the rewrite throws', () => {
+    const { path } = setup()
+    appendEntry(path, note('A'))
+    appendEntry(path, note('B'))
+    const id = readEntries(path, '/dev/null', () => {})[0]!.key
+    mkdirSync(`${path}.tmp-${process.pid}`) // a directory makes the rewrite fail
+    expect(() => removeEntry(path, id)).toThrow()
+    expect(existsSync(`${path}.lock`)).toBe(false)
+  })
+
+  test('does not remove a lock that another process took over', () => {
+    const { path } = setup()
+    withQueueLock(path, () => {}, () => {
+      // A stale-lock breaker replaced our lock while we held it.
+      writeFileSync(`${path}.lock`, 'someone else')
+    })
+    expect(readFileSync(`${path}.lock`, 'utf8')).toBe('someone else')
+  })
+
+  test('releases the lock after a normal append and rewrite', () => {
+    const { path } = setup()
+    const id = appendEntry(path, note('A'))
+    expect(existsSync(`${path}.lock`)).toBe(false)
+    setAttempts(path, id, 1)
+    removeEntry(path, id)
+    expect(existsSync(`${path}.lock`)).toBe(false)
+  })
+})
+
+describe('give-up warning', () => {
+  test('a failed removal after the warning retries only the removal', async () => {
+    const g = gatedSetup()
+    await g.open()
+    g.write('idle', SETTLE_MS)
+    await g.q.enqueue(note('A'))
+    await g.q.enqueue(note('B'))
+    for (let i = 0; i < MAX_ATTEMPTS - 1; i++) {
+      g.advance(ACK_TIMEOUT_MS)
+      await g.q.pump()
+    }
+    mkdirSync(`${g.path}.tmp-${process.pid}`) // removal now fails
+    g.advance(ACK_TIMEOUT_MS)
+    await g.q.pump()
+    expect(g.warns).toHaveLength(1)
+    for (let i = 0; i < 5; i++) {
+      g.advance(1_000)
+      await g.q.pump()
+    }
+    expect(g.warns).toHaveLength(1) // not once per poll
+    expect(g.sent.filter(c => c === 'A')).toHaveLength(MAX_ATTEMPTS)
+    rmSync(`${g.path}.tmp-${process.pid}`, { recursive: true })
+    await g.q.pump()
+    expect(queued(g.path, g.corruptPath)[0]).toBe('B')
+    expect(g.warns).toHaveLength(1)
+  })
+})
+
+describe('server.ts shutdown', () => {
+  test('does not remove the session marker', () => {
+    const src = readFileSync(join(import.meta.dir, '..', 'server.ts'), 'utf8')
+    const start = src.indexOf('function shutdown(): void {')
+    const body = src.slice(start, src.indexOf("process.stdin.on('end', shutdown)", start))
+    expect(start).toBeGreaterThan(0)
+    expect(body).toContain('queue.close()')
+    // The only file the shutdown removes is bot.pid.
+    expect([...body.matchAll(/rmSync\(([^)]*)\)/g)].map(m => m[1])).toEqual(['PID_FILE'])
+    // The sweep of dead processes' markers is the only removal.
+    expect(src).toMatch(/sweepDeadStateFiles\(STATE_DIR, log\)/)
   })
 })

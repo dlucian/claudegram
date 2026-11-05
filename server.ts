@@ -1209,11 +1209,14 @@ function shutdown(): void {
   try {
     if (parseInt(readFileSync(PID_FILE, 'utf8'), 10) === process.pid) rmSync(PID_FILE)
   } catch {}
-  // Stop delivering, and remove this session's marker. The queue file stays,
-  // so the next plugin process replays whatever was still held. `queue` is
-  // declared further down, so a shutdown that fires first just skips it.
+  // Stop delivering. The queue file stays, so the next plugin process replays
+  // whatever was still held. The session-state marker stays too: it belongs to
+  // the claude process, which can outlive this MCP server (a restart inside the
+  // same session), and deleting a live `busy` marker would release held
+  // messages into the running turn. sweepDeadStateFiles removes it once that
+  // process is dead. `queue` is declared further down, so a shutdown that fires
+  // first just skips it.
   try { queue.close() } catch {}
-  try { if (ownerPid !== null) rmSync(join(STATE_DIR, 'session-state', String(ownerPid)), { force: true }) } catch {}
   // bot.stop() signals the poll loop to end; the current getUpdates request
   // may take up to its long-poll timeout to return. Force-exit after 2s.
   setTimeout(() => process.exit(0), 2000)
@@ -2157,7 +2160,8 @@ const queue = createQueue({
   },
 })
 // Drop markers whose claude process is gone, so a stale `busy` from a killed
-// session can never be read by a later one that reuses the PID.
+// session can never be read by a later one that reuses the PID. This is the
+// only place a marker is removed.
 sweepDeadStateFiles(STATE_DIR, log)
 // A notification sent before the harness registers its channel handler
 // can disappear, so wait before the first pump. The queue also keeps each entry

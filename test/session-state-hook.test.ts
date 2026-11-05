@@ -62,6 +62,15 @@ describe('gate', () => {
     }
   })
 
+  test('writes nothing when the detector prints a PID and exits 1', () => {
+    // The real detector prints the nearest claude ancestor's PID on exit 0 and on exit 1.
+    // Exit 1 means that session has no Telegram channel, so the PID must not become a file.
+    const s = setup({ rc: 1, out: '4242' })
+    for (const action of ['idle', 'busy', 'tool']) expect(run(action, s).code).toBe(0)
+    expect(existsSync(join(s.stateDir, 'session-state'))).toBe(false)
+    expect(existsSync(s.file())).toBe(false)
+  })
+
   test('writes nothing when an older detector reads --print-pid as a PID', () => {
     // The real script exits 2 for a non-numeric PID; this stub does the same and prints nothing.
     const s = setup({ rc: 2 })

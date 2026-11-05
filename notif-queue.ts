@@ -21,7 +21,7 @@
 import { randomUUID } from 'crypto'
 import {
   appendFileSync, closeSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync,
-  renameSync, rmSync, statSync, writeFileSync,
+  renameSync, rmSync, statSync, writeFileSync, writeSync,
 } from 'fs'
 import { basename, dirname, join } from 'path'
 
@@ -160,6 +160,83 @@ function parseLine(line: string): Parsed | null {
   }
 }
 
+/** How long a writer waits for the queue lock before it goes ahead without it. */
+export const LOCK_WAIT_MS = 200
+/** A lock file older than this is a leftover from a crashed process and gets broken. */
+export const LOCK_STALE_MS = 2_000
+const LOCK_POLL_MS = 2
+
+/**
+ * Blocks the thread for about `ms`. Under Bun, `Atomics.wait` overshoots a
+ * short wait by a factor of ten or more (5 ms took 39 ms), so use
+ * `Bun.sleepSync`, which overshoots less.
+ */
+function sleepSync(ms: number): void {
+  const bun = (globalThis as { Bun?: { sleepSync(ms: number): void } }).Bun
+  if (bun) bun.sleepSync(ms)
+  else Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+}
+
+/**
+ * Takes `<path>` with `O_EXCL` and returns the function that releases it. The
+ * lock FAILS OPEN: when it is busy past `LOCK_WAIT_MS`, or cannot be created,
+ * it logs and returns a no-op release, because a stuck lock must never keep an
+ * inbound message out of the queue. A lock file older than `LOCK_STALE_MS` is
+ * broken. Two processes that break the same stale lock at once can still
+ * overlap, which is the unlocked behavior and nothing worse.
+ */
+function acquireLock(lockPath: string, log: Log): () => void {
+  const token = `${process.pid}.${randomUUID()}`
+  const deadline = Date.now() + LOCK_WAIT_MS
+  for (let first = true; ; first = false) {
+    if (!first && Date.now() >= deadline) {
+      log(`queue lock ${basename(lockPath)} stayed busy for ${LOCK_WAIT_MS} ms; continuing without it`)
+      return () => {}
+    }
+    try {
+      const fd = openSync(lockPath, 'wx', 0o600)
+      try {
+        writeSync(fd, token)
+      } catch {
+        closeSync(fd)
+        try { rmSync(lockPath, { force: true }) } catch {}
+        return () => {}
+      }
+      closeSync(fd)
+      return () => {
+        // Remove the lock only while it is still ours: a stale-lock breaker may have replaced it.
+        try { if (readFileSync(lockPath, 'utf8') === token) rmSync(lockPath, { force: true }) } catch {}
+      }
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code
+      if (code === 'ENOENT') return () => {} // no queue directory yet, so nothing to protect
+      if (code !== 'EEXIST') {
+        log(`cannot take the queue lock (${code ?? 'error'}); continuing without it`)
+        return () => {}
+      }
+      try {
+        if (Date.now() - statSync(lockPath).mtimeMs >= LOCK_STALE_MS) {
+          rmSync(lockPath, { force: true })
+          continue
+        }
+      } catch {
+        continue // the holder released it between our attempts
+      }
+    }
+    sleepSync(LOCK_POLL_MS)
+  }
+}
+
+/** Runs `fn` while holding the queue's cross-process lock. The lock is released on every exit, including a throw. */
+export function withQueueLock<T>(path: string, log: Log, fn: () => T): T {
+  const release = acquireLock(`${path}.lock`, log)
+  try {
+    return fn()
+  } finally {
+    release()
+  }
+}
+
 /**
  * Appends `notification` as one line and returns its `_id`. Throws on a write
  * failure, so the caller can send directly.
@@ -167,21 +244,35 @@ function parseLine(line: string): Parsed | null {
  * The leading newline keeps a line torn by a failed write from merging with
  * this one. Blank lines are harmless, because every reader drops them.
  */
-export function appendEntry(path: string, notification: Notification, nowMs: number = Date.now()): string {
+export function appendEntry(
+  path: string,
+  notification: Notification,
+  nowMs: number = Date.now(),
+  log: Log = () => {},
+): string {
   const _id = randomUUID()
   const line = JSON.stringify({ ...notification, _id, _queuedAt: new Date(nowMs).toISOString() })
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
-  appendFileSync(path, '\n' + line + '\n', { mode: 0o600 })
+  withQueueLock(path, log, () => appendFileSync(path, '\n' + line + '\n', { mode: 0o600 }))
   return _id
 }
 
 /**
  * Rewrites the queue file from a fresh read, with no await between the read
- * and the rename. `edit` sees each line in order: the first line for which it
+ * and the rename, while holding the queue lock so an append from another
+ * process can't land between them and be erased. `edit` sees each line in order: the first line for which it
  * returns a string is replaced by that string, or removed when it returns null.
  * Lines that don't parse stay verbatim. Throws on a write failure.
  */
-function rewriteLines(path: string, edit: (line: string) => string | null | undefined): void {
+function rewriteLines(
+  path: string,
+  edit: (line: string) => string | null | undefined,
+  log: Log = () => {},
+): void {
+  withQueueLock(path, log, () => rewriteLocked(path, edit))
+}
+
+function rewriteLocked(path: string, edit: (line: string) => string | null | undefined): void {
   let raw: string
   try {
     raw = readFileSync(path, 'utf8')
@@ -217,8 +308,8 @@ function rewriteLines(path: string, edit: (line: string) => string | null | unde
   }
 }
 
-function rewriteWithout(path: string, drop: (line: string) => boolean): void {
-  rewriteLines(path, line => (drop(line) ? null : undefined))
+function rewriteWithout(path: string, drop: (line: string) => boolean, log: Log = () => {}): void {
+  rewriteLines(path, line => (drop(line) ? null : undefined), log)
 }
 
 /**
@@ -226,17 +317,17 @@ function rewriteWithout(path: string, drop: (line: string) => boolean): void {
  * count. A line without an `_id` has no stable key, so it is left alone.
  * Throws on a write failure.
  */
-export function setAttempts(path: string, key: string, attempts: number): void {
+export function setAttempts(path: string, key: string, attempts: number, log: Log = () => {}): void {
   rewriteLines(path, line => {
     const parsed = parseLine(line)
     if (!parsed?.hasId || parsed.key !== key) return undefined
     return JSON.stringify({ ...(JSON.parse(line) as Record<string, unknown>), _attempts: attempts })
-  })
+  }, log)
 }
 
 /** Removes the first entry whose key matches. Throws on a write failure. */
-export function removeEntry(path: string, key: string): void {
-  rewriteWithout(path, line => parseLine(line)?.key === key)
+export function removeEntry(path: string, key: string, log: Log = () => {}): void {
+  rewriteWithout(path, line => parseLine(line)?.key === key, log)
 }
 
 /**
@@ -270,7 +361,7 @@ export function readEntries(path: string, corruptPath: string, log: Log): QueueE
         appendFileSync(corruptPath, line + '\n', { mode: 0o600 })
         quarantined.add(marker)
       }
-      rewriteWithout(path, l => l === line)
+      rewriteWithout(path, l => l === line, log)
       quarantined.delete(marker)
       moved++
     } catch {
@@ -396,7 +487,7 @@ export function createQueue(opts: QueueOptions): Queue {
 
   function removeHead(head: QueueEntry): boolean {
     try {
-      removeEntry(path, head.key)
+      removeEntry(path, head.key, log)
       return true
     } catch (err) {
       log(`cannot remove a delivered notification, it will be sent again: ${err}`)
@@ -407,8 +498,19 @@ export function createQueue(opts: QueueOptions): Queue {
   /**
    * Sends the head once and returns the time just before the send, or null, with the head kept, when the send
    * rejects or times out. `persist` records the send count in the queue line, for an entry that stays queued.
+   *
+   * `stillOk` re-reads the marker as the last step before the send. When it returns false, a terminal prompt or
+   * another turn started since the decision, so the entry stays queued and the result is `'held'`. The release
+   * hook runs after the check, so a held entry keeps its queued reaction. A turn that starts between this check
+   * and the send can still absorb the message; the window is a few microtasks, and no check closes it.
    */
-  async function sendHead(head: QueueEntry, attempts: number, persist: boolean): Promise<number | null> {
+  async function sendHead(
+    head: QueueEntry,
+    attempts: number,
+    persist: boolean,
+    stillOk?: () => boolean,
+  ): Promise<number | null | 'held'> {
+    if (stillOk && !stillOk()) return 'held'
     if (opts.onRelease) {
       try {
         await withTimeout(opts.onRelease(head.notification, { fresh: head.key === appendedKey }), 3_000, 'release hook')
@@ -428,7 +530,7 @@ export function createQueue(opts: QueueOptions): Queue {
     remember(sentKeys, head.key)
     if (persist) {
       try {
-        setAttempts(path, head.key, attempts)
+        setAttempts(path, head.key, attempts, log)
       } catch (err) {
         log(`cannot record the send count: ${err}`)
       }
@@ -452,7 +554,10 @@ export function createQueue(opts: QueueOptions): Queue {
       }
     }
     flight = null
-    return removeHead(head)
+    if (removeHead(head)) return true
+    // The warning is out. Later passes retry only the removal, never the warning.
+    removeOnly = head.key
+    return false
   }
 
   /** Sends head entries until none remain or one fails. Used when nothing gates delivery. */
@@ -464,6 +569,19 @@ export function createQueue(opts: QueueOptions): Queue {
     }
     if ((await sendHead(head, (head.attempts ?? 0) + 1, false)) === null) return false
     return removeHead(head)
+  }
+
+  function readStateSafe(): SessionState | null {
+    try { return opts.readState!() } catch { return null }
+  }
+
+  /** Whether the head may leave the queue now, given the marker: send, send under the fail-open rule, or hold. */
+  function decideRelease(head: QueueEntry, state: SessionState | null, t: number): 'now' | 'fail-open' | 'hold' {
+    if (state === null) return 'now'
+    if (state.state === 'idle') return t - state.mtimeMs >= SETTLE_MS ? 'now' : 'hold'
+    const queuedMs = head.queuedAt ? Date.parse(head.queuedAt) : NaN
+    const capExpired = !(t - queuedMs < MAX_HOLD_MS)
+    return t - state.mtimeMs >= STALE_BUSY_MS || capExpired ? 'fail-open' : 'hold'
   }
 
   /** One decision about the head. Returns true when the loop can look at the next entry. */
@@ -492,30 +610,25 @@ export function createQueue(opts: QueueOptions): Queue {
       if (acked || t - f.sentAt < ACK_TIMEOUT_MS) return false
       // The session wrote nothing since the send: the notification probably never became a turn.
       if (f.attempts >= MAX_ATTEMPTS) return giveUp(head)
-      const sentAt = await sendHead(head, f.attempts + 1, true)
-      if (sentAt !== null) flight = { key: head.key, sentAt, attempts: f.attempts + 1 }
+      const sentAt = await sendHead(head, f.attempts + 1, true, () => {
+        const latest = readStateSafe()
+        return !(latest !== null && latest.mtimeMs > f.sentAt) // a state write since the send is an acknowledgement
+      })
+      if (sentAt !== null && sentAt !== 'held') flight = { key: head.key, sentAt, attempts: f.attempts + 1 }
       return false
     }
 
     if ((head.attempts ?? 0) >= MAX_ATTEMPTS) return giveUp(head)
 
-    const queuedMs = head.queuedAt ? Date.parse(head.queuedAt) : NaN
-    const capExpired = !(t - queuedMs < MAX_HOLD_MS)
-    let release: 'now' | 'fail-open' | 'hold'
-    if (state === null) release = 'now'
-    else if (state.state === 'busy') {
-      release = t - state.mtimeMs >= STALE_BUSY_MS || capExpired ? 'fail-open' : 'hold'
-    } else {
-      release = t - state.mtimeMs >= SETTLE_MS ? 'now' : 'hold'
-    }
+    let release = decideRelease(head, state, t)
     if (release === 'fail-open' && t - lastFailOpenAt < FAIL_OPEN_SPACING_MS) release = 'hold'
     if (release === 'hold') return false
 
     // An entry that an earlier process persisted proves the hooks ran there; a fresh one needs a state file here.
     const track = release === 'now' && (state !== null || sawState || !ownKeys.has(head.key))
     const attempts = (head.attempts ?? 0) + 1
-    const sentAt = await sendHead(head, attempts, track)
-    if (sentAt === null) return false
+    const sentAt = await sendHead(head, attempts, track, () => decideRelease(head, readStateSafe(), now()) !== 'hold')
+    if (sentAt === null || sentAt === 'held') return false
     if (release === 'fail-open') lastFailOpenAt = t
     if (track) {
       flight = { key: head.key, sentAt, attempts }
@@ -594,7 +707,7 @@ export function createQueue(opts: QueueOptions): Queue {
     async enqueue(n) {
       let key: string
       try {
-        key = appendEntry(path, n, now())
+        key = appendEntry(path, n, now(), log)
       } catch (err) {
         log(`failed to queue notification, sending directly: ${err}`)
         try {
