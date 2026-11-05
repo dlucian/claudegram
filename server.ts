@@ -25,6 +25,7 @@ import { join, extname, sep } from 'path'
 import { execSync, spawn } from 'child_process'
 import { formatPermissionPrompt } from './permission-format.ts'
 import { isPluginWrapper } from './stale-poller.ts'
+import { BOOT_GRACE_MS, createQueue } from './notif-queue.ts'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -2049,63 +2050,23 @@ async function handleInbound(
   }, text, telegramTs)
 }
 
-// Durable inbound delivery. When Claude Code's MCP stdio pipe is closed
-// (e.g., CC crashed or the user is between sessions), mcp.notification()
-// rejects and we'd otherwise lose the message — Telegram's getUpdates
-// advances the offset regardless of downstream success, so we get one shot.
-// Queue failed notifications to disk, retry-flush before each new send.
+// Durable inbound delivery. Telegram's getUpdates advances the offset
+// regardless of downstream success, so a message gets one shot. Every channel
+// notification therefore goes through the on-disk queue in notif-queue.ts:
+// append a line, send the head, and remove that line by identity once the send
+// resolves. A line appended during a send survives, and an unparsable line
+// moves to the corrupt file instead of blocking the entries behind it.
 const NOTIF_QUEUE = join(STATE_DIR, 'pending_notifications.jsonl')
-
-async function flushQueue(): Promise<void> {
-  if (!existsSync(NOTIF_QUEUE)) return
-  let raw: string
-  try {
-    raw = readFileSync(NOTIF_QUEUE, 'utf8')
-  } catch {
-    return
-  }
-  const lines = raw.split('\n').filter(l => l.length > 0)
-  if (lines.length === 0) {
-    try { rmSync(NOTIF_QUEUE) } catch {}
-    return
-  }
-  const remaining: string[] = []
-  let blocked = false
-  for (const line of lines) {
-    if (blocked) { remaining.push(line); continue }
-    try {
-      const entry = JSON.parse(line)
-      // Strip our bookkeeping field before re-sending.
-      delete entry._queuedAt
-      await mcp.notification(entry)
-    } catch {
-      blocked = true
-      remaining.push(line)
-    }
-  }
-  if (remaining.length === 0) {
-    try { rmSync(NOTIF_QUEUE) } catch {}
-  } else {
-    writeFileSync(NOTIF_QUEUE, remaining.join('\n') + '\n', { mode: 0o600 })
-  }
-}
+const NOTIF_CORRUPT = join(STATE_DIR, 'pending_notifications.corrupt.jsonl')
+const log = (message: string) => process.stderr.write(`telegram channel: ${message}\n`)
+const queue = createQueue({ path: NOTIF_QUEUE, corruptPath: NOTIF_CORRUPT, send: n => mcp.notification(n), log })
+// A notification sent before the harness registers its channel handler
+// probably disappears, so wait before the first flush. Messages queued before
+// a restart go out when the timer fires.
+setTimeout(() => queue.open(), BOOT_GRACE_MS)
 
 async function notifyOrQueue(entry: { method: string; params: unknown }): Promise<void> {
-  // Always try the queue first — if CC just reconnected, drain before
-  // appending fresh traffic so order is preserved.
-  await flushQueue().catch(() => {})
-  try {
-    await mcp.notification(entry)
-  } catch (err) {
-    const tagged = { ...entry, _queuedAt: new Date().toISOString() }
-    try {
-      mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
-      appendFileSync(NOTIF_QUEUE, JSON.stringify(tagged) + '\n', { mode: 0o600 })
-      process.stderr.write(`telegram channel: MCP unreachable, queued notification (${err})\n`)
-    } catch (writeErr) {
-      process.stderr.write(`telegram channel: failed to queue notification: ${writeErr}\n`)
-    }
-  }
+  await queue.enqueue(entry)
 }
 
 // Without this, any throw in a message handler stops polling permanently
