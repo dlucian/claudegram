@@ -256,17 +256,22 @@ describe('hooks.json', () => {
   >
   const commandsFor = (event: string) => hooks[event]!.flatMap(g => g.hooks.map(h => h.command))
 
-  test('excludes compact from the SessionStart matcher', () => {
+  test('includes compact in the SessionStart matcher', () => {
     expect(hooks.SessionStart).toHaveLength(1)
     const matcher = hooks.SessionStart![0]!.matcher!
-    expect(matcher.split('|').sort()).toEqual(['clear', 'resume', 'startup'])
-    expect(matcher).not.toContain('compact')
+    expect(matcher.split('|').sort()).toEqual(['clear', 'compact', 'resume', 'startup'])
+  })
+
+  test('marks the session busy for a manual or automatic compaction', () => {
+    expect(hooks.PreCompact).toHaveLength(1)
+    expect(hooks.PreCompact![0]!.matcher!.split('|').sort()).toEqual(['auto', 'manual'])
   })
 
   test('maps each event to its action', () => {
     const action = (event: string) => commandsFor(event).filter(c => c.includes('session-state.sh')).map(c => c.split(' ').pop())
     expect(action('SessionStart')).toEqual(['idle'])
     expect(action('UserPromptSubmit')).toEqual(['busy'])
+    expect(action('PreCompact')).toEqual(['busy'])
     expect(action('PreToolUse')).toEqual(['tool'])
     expect(action('Stop')).toEqual(['idle'])
     expect(action('StopFailure')).toEqual(['idle'])

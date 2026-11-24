@@ -11,9 +11,12 @@
 # ancestor's file, so another session can never mark this one busy or idle.
 #
 # Usage: session-state.sh <idle|busy|tool>
-#   idle  SessionStart (startup, resume, clear), Stop, StopFailure, and the
-#         Notification idle_prompt backstop for a turn that ended without Stop
-#   busy  UserPromptSubmit
+#   idle  SessionStart (startup, resume, clear, compact), Stop, StopFailure, and
+#         the Notification idle_prompt backstop for a turn that ended without Stop
+#   busy  UserPromptSubmit, and PreCompact (manual or auto). A compaction fires
+#         no UserPromptSubmit or PreToolUse, so without PreCompact the marker
+#         keeps the last idle and the queue sends into a session that can't
+#         start a turn (dlucian/ezri#490). SessionStart compact ends the hold.
 #   tool  PreToolUse. A main-thread call writes busy. A call with an agent_id
 #         (a subagent) only refreshes the mtime, and only while the file says
 #         busy, so a background subagent can't turn an idle session busy.
