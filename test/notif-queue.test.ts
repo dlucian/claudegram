@@ -761,6 +761,49 @@ describe('missing and foreign state', () => {
   })
 })
 
+describe('context compaction (dlucian/ezri#490)', () => {
+  test('holds a message through a compaction and sends it once after', async () => {
+    const g = gatedSetup()
+    await g.open()
+    g.write('idle', SETTLE_MS) // the last Stop wrote idle
+    g.write('busy') // PreCompact writes busy
+    expect(await g.q.enqueue(note('A'))).toBe('held')
+    // A compaction takes minutes and writes nothing; the marker stays busy and fresh enough.
+    for (let i = 0; i < 4; i++) {
+      g.advance(60_000)
+      await g.q.pump()
+    }
+    expect(g.sent).toEqual([])
+    g.advance(10_000)
+    g.write('idle') // SessionStart with source compact writes idle
+    g.advance(SETTLE_MS)
+    await g.q.pump()
+    expect(g.sent).toEqual(['A'])
+    g.advance(1_000)
+    g.write('busy') // the turn for A starts
+    g.advance(1_000)
+    await g.q.pump()
+    g.advance(ACK_TIMEOUT_MS * MAX_ATTEMPTS)
+    g.write('idle')
+    await g.q.pump()
+    expect(g.sent).toEqual(['A'])
+    expect(g.warns).toEqual([])
+  })
+
+  test('without a busy write the queue sends into the compaction and warns (the bug)', async () => {
+    const g = gatedSetup()
+    await g.open()
+    g.write('idle', SETTLE_MS) // PreCompact is not registered, so the marker stays idle
+    await g.q.enqueue(note('A'))
+    for (let i = 0; i < 4 * MAX_ATTEMPTS; i++) {
+      g.advance(ACK_TIMEOUT_MS)
+      await g.q.pump()
+    }
+    expect(g.sent).toEqual(['A', 'A', 'A'])
+    expect(g.warns).toHaveLength(1)
+  })
+})
+
 describe('in flight', () => {
   test('keeps a sent head until an idle write later than the send', async () => {
     const g = gatedSetup()

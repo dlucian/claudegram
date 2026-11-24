@@ -249,6 +249,58 @@ describe('failure modes', () => {
   })
 })
 
+describe('compaction', () => {
+  const flagOf = (s: ReturnType<typeof setup>) => join(s.stateDir, 'compact-pending', '4242')
+
+  test('compact-start writes busy and creates the flag outside session-state', () => {
+    const s = setup()
+    run('idle', s)
+    const r = run('compact-start', s)
+    expect(r.code).toBe(0)
+    expect(r.stdout).toBe('')
+    expect(word(s.file())).toBe('busy')
+    expect(existsSync(flagOf(s))).toBe(true)
+    expect(statSync(join(s.stateDir, 'compact-pending')).mode & 0o777).toBe(0o700)
+    expect(readdirSync(join(s.stateDir, 'session-state'))).toEqual(['4242'])
+  })
+
+  test('compact-end with a flag writes idle and removes it', () => {
+    const s = setup()
+    run('compact-start', s)
+    expect(run('compact-end', s).code).toBe(0)
+    expect(word(s.file())).toBe('idle')
+    expect(existsSync(flagOf(s))).toBe(false)
+  })
+
+  test('compact-end without a flag leaves a busy marker untouched', () => {
+    const s = setup()
+    run('busy', s) // an auto-compaction in the middle of a turn
+    const before = statSync(s.file()).mtimeMs
+    expect(run('compact-end', s).code).toBe(0)
+    expect(word(s.file())).toBe('busy')
+    expect(statSync(s.file()).mtimeMs).toBe(before)
+  })
+
+  test('compact-end removes a flag older than one hour and writes nothing', () => {
+    const s = setup()
+    run('compact-start', s)
+    run('busy', s)
+    const old = new Date(Date.now() - 61 * 60_000)
+    utimesSync(flagOf(s), old, old)
+    expect(run('compact-end', s).code).toBe(0)
+    expect(existsSync(flagOf(s))).toBe(false)
+    expect(word(s.file())).toBe('busy')
+  })
+
+  test('the compact actions write nothing when the detector says no channel', () => {
+    const s = setup({ rc: 1, out: '4242' })
+    run('compact-start', s)
+    run('compact-end', s)
+    expect(existsSync(join(s.stateDir, 'session-state'))).toBe(false)
+    expect(existsSync(join(s.stateDir, 'compact-pending'))).toBe(false)
+  })
+})
+
 describe('hooks.json', () => {
   const hooks = JSON.parse(readFileSync(join(import.meta.dir, '..', 'hooks', 'hooks.json'), 'utf8')).hooks as Record<
     string,
@@ -256,17 +308,25 @@ describe('hooks.json', () => {
   >
   const commandsFor = (event: string) => hooks[event]!.flatMap(g => g.hooks.map(h => h.command))
 
-  test('excludes compact from the SessionStart matcher', () => {
-    expect(hooks.SessionStart).toHaveLength(1)
-    const matcher = hooks.SessionStart![0]!.matcher!
-    expect(matcher.split('|').sort()).toEqual(['clear', 'resume', 'startup'])
-    expect(matcher).not.toContain('compact')
+  test('keeps compact out of the startup|resume|clear entry and gives it its own', () => {
+    expect(hooks.SessionStart).toHaveLength(2)
+    const [plain, compact] = hooks.SessionStart!
+    expect(plain!.matcher!.split('|').sort()).toEqual(['clear', 'resume', 'startup'])
+    expect(plain!.hooks.map(h => h.command.split(' ').pop())).toEqual(['idle'])
+    expect(compact!.matcher).toBe('compact')
+    expect(compact!.hooks.map(h => h.command.split(' ').pop())).toEqual(['compact-end'])
+  })
+
+  test('runs compact-start for a manual compaction only', () => {
+    expect(hooks.PreCompact).toHaveLength(1)
+    expect(hooks.PreCompact![0]!.matcher).toBe('manual')
   })
 
   test('maps each event to its action', () => {
     const action = (event: string) => commandsFor(event).filter(c => c.includes('session-state.sh')).map(c => c.split(' ').pop())
-    expect(action('SessionStart')).toEqual(['idle'])
+    expect(action('SessionStart')).toEqual(['idle', 'compact-end'])
     expect(action('UserPromptSubmit')).toEqual(['busy'])
+    expect(action('PreCompact')).toEqual(['compact-start'])
     expect(action('PreToolUse')).toEqual(['tool'])
     expect(action('Stop')).toEqual(['idle'])
     expect(action('StopFailure')).toEqual(['idle'])

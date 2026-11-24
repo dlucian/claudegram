@@ -10,13 +10,26 @@
 # The file's mtime is the signal time. The plugin reads only its own claude
 # ancestor's file, so another session can never mark this one busy or idle.
 #
-# Usage: session-state.sh <idle|busy|tool>
+# Usage: session-state.sh <idle|busy|tool|compact-start|compact-end>
 #   idle  SessionStart (startup, resume, clear), Stop, StopFailure, and the
 #         Notification idle_prompt backstop for a turn that ended without Stop
 #   busy  UserPromptSubmit
 #   tool  PreToolUse. A main-thread call writes busy. A call with an agent_id
 #         (a subagent) only refreshes the mtime, and only while the file says
 #         busy, so a background subagent can't turn an idle session busy.
+#   compact-start  PreCompact, manual only. Writes busy and creates the flag
+#         $state_dir/compact-pending/<pid>. A manual /compact runs while the
+#         session is idle and fires no other hook, so without this the marker
+#         keeps the last idle and the queue sends into a session that can't
+#         start a turn (dlucian/ezri#490). The flag lives outside session-state/
+#         so the marker reader and the stale-file sweep never see it.
+#   compact-end  SessionStart, source compact. Writes idle and deletes the flag
+#         only when this pid's flag exists and is younger than one hour. An
+#         auto-compaction has no PreCompact hook and no flag: it runs mid-turn,
+#         the session is already busy, and Stop writes idle at the end. Writing
+#         idle there would release a held message into the running turn
+#         (dlucian/ezri#474 excludes compact for that reason). A flag older than
+#         one hour is deleted without a write.
 #
 # Rules, as for ezri-typing-ping: no stdout, bounded work, exit 0 on every
 # path. A missing state file means "deliver at once", so every failure here
@@ -30,7 +43,7 @@
 
 {
   action="${1:-}"
-  case "$action" in idle | busy | tool) ;; *) exit 0 ;; esac
+  case "$action" in idle | busy | tool | compact-start | compact-end) ;; *) exit 0 ;; esac
 
   detect="${CLAUDEGRAM_CHANNEL_DETECT:-$HOME/ezri/bin/ezri-tg-channel-active}"
   [ -x "$detect" ] || exit 0
@@ -61,7 +74,20 @@
     exit 0
   fi
 
-  case "$action" in idle) word=idle ;; *) word=busy ;; esac
+  flag_dir="$state_dir/compact-pending"
+  flag="$flag_dir/$pid"
+  if [ "$action" = compact-end ]; then
+    [ -f "$flag" ] || exit 0
+    if [ -n "$(find "$flag" -mmin +60 2>/dev/null)" ]; then
+      rm -f "$flag" 2>/dev/null
+      exit 0
+    fi
+    rm -f "$flag" 2>/dev/null
+  elif [ "$action" = compact-start ]; then
+    mkdir -p -m 700 "$flag_dir" 2>/dev/null && touch "$flag" 2>/dev/null
+  fi
+
+  case "$action" in idle | compact-end) word=idle ;; *) word=busy ;; esac
   tmp="$dir/.$pid.$$.tmp"
   if printf '%s\n' "$word" >"$tmp" 2>/dev/null && mv -f "$tmp" "$file" 2>/dev/null; then
     :
